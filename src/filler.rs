@@ -1,35 +1,36 @@
 //! Filler Bot
 use std::{
     collections::BTreeMap,
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anchor_lang::Discriminator;
 use drift_rs::{
-    constants::PROGRAM_ID,
     dlob::{
         CrossesAndTopMakers, CrossingRegion, DLOBNotifier, MakerCrosses, OrderKind, TakerOrder,
         DLOB,
     },
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
-    grpc::{grpc_subscriber::AccountFilter, AccountUpdate, TransactionUpdate},
     priority_fee_subscriber::PriorityFeeSubscriber,
+    slot_subscriber::SlotSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
         accounts::{User, UserStats},
         CommitmentConfig, MarketId, MarketPrecision, MarketStatus, MarketType, Order,
         OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
-        RpcSendTransactionConfig, VersionedMessage, AMM,
+        RpcSendTransactionConfig, UnsubHandle, VersionedMessage, AMM,
     },
-    DriftClient, GrpcSubscribeOpts, Pubkey, TransactionBuilder, Wallet,
+    utils::get_ws_url,
+    websocket_program_account_subscriber::{
+        WebsocketProgramAccountOptions, WebsocketProgramAccountSubscriber,
+    },
+    DriftClient, Pubkey, TransactionBuilder, Wallet,
 };
 use futures_util::StreamExt;
 use solana_account_decoder_client_types::UiAccountEncoding;
-use solana_rpc_client_api::config::{
-    RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
-};
+use solana_rpc_client_api::config::RpcTransactionConfig;
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction, signature::Signature, transaction::TransactionError,
 };
@@ -39,10 +40,17 @@ use tokio::{runtime::Handle, sync::RwLock};
 use crate::{
     http::Metrics,
     util::{OrderSlotLimiter, PendingTxMeta, PendingTxs, PythPriceUpdate, TxIntent},
+    ws_cache::{sync_stats_accounts_ws, sync_user_accounts_ws, WsAccountCache},
     Config, UseMarkets,
 };
 
 const TARGET: &str = "filler";
+
+struct WsSubscriptions {
+    user_unsub: UnsubHandle,
+    stats_unsub: UnsubHandle,
+    slot_subscriber: SlotSubscriber,
+}
 
 pub struct FillerBot {
     drift: DriftClient,
@@ -56,6 +64,8 @@ pub struct FillerBot {
     tx_worker_ref: TxSender,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
+    user_cache: WsAccountCache,
+    _ws_subscriptions: WsSubscriptions,
 }
 
 impl FillerBot {
@@ -107,14 +117,15 @@ impl FillerBot {
         log::info!(target: TARGET, "subscribed swift orders");
 
         drift.subscribe_blockhashes().await.expect("subscribed");
-        let slot_rx = setup_grpc(
-            drift.clone(),
-            dlob,
-            tx_worker_ref.clone(),
-            market_ids.clone(),
-        )
-        .await;
-        log::info!(target: TARGET, "subscribed gRPC");
+        let (slot_rx, user_cache, ws_subscriptions) =
+            setup_ws(drift.clone(), dlob, market_ids.clone()).await;
+        log::info!(target: TARGET, "subscribed ws");
+        if let Err(err) = user_cache
+            .get_user_or_fetch(&drift, &filler_subaccount)
+            .await
+        {
+            log::warn!(target: TARGET, "failed to warm filler account: {err:?}");
+        }
 
         // pyth disabled for now
         let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
@@ -138,6 +149,8 @@ impl FillerBot {
             tx_worker_ref,
             priority_fee_subscriber,
             pyth_price_feed,
+            user_cache,
+            _ws_subscriptions: ws_subscriptions,
         }
     }
 
@@ -152,6 +165,7 @@ impl FillerBot {
         let config = self.config.clone();
         let tx_worker_ref = self.tx_worker_ref.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
+        let user_cache = self.user_cache.clone();
         let mut slot = 0;
         let mut use_median_trigger_price = drift
             .state_account()
@@ -245,6 +259,7 @@ impl FillerBot {
                                     filler_subaccount,
                                     signed_order,
                                     crosses,
+                                    &user_cache,
                                     tx_worker_ref.clone(),
                                 ).await;
                             }
@@ -291,6 +306,7 @@ impl FillerBot {
                                 market_index,
                                 filler_subaccount,
                                 crosses_and_top_makers,
+                                &user_cache,
                                 tx_worker_ref.clone(),
                                 pyth_update,
                                 trigger_price,
@@ -304,7 +320,7 @@ impl FillerBot {
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
                                 log::info!(target: TARGET, "found limit crosses (market: {market_index})");
-                                try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &tx_worker_ref);
+                                try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &user_cache, &tx_worker_ref);
                             }
                         }
 
@@ -332,69 +348,141 @@ impl FillerBot {
                 }
             }
         }
+        if let Err(err) = drift.unsubscribe().await {
+            log::warn!(target: TARGET, "ws unsubscribe failed: {err:?}");
+        }
         drift.grpc_unsubscribe();
         log::info!(target: TARGET, "filler shutting down...");
     }
 }
 
-fn on_transaction_update_fn(
-    tx_worker_ref: TxSender,
-) -> impl Fn(&TransactionUpdate) + Send + Sync + 'static {
-    move |tx: &TransactionUpdate| {
-        if let Some(sig) = tx.transaction.signatures.first() {
-            tx_worker_ref.confirm_tx((sig.as_slice().try_into()).expect("valid signature"));
-        } else {
-            log::warn!(target: TARGET, "received tx without sig: {tx:?}");
-        }
-    }
-}
-
-fn on_slot_update_fn(
+/// Setup WS subscriptions
+///
+/// Syncs User orders and UserStat accounts
+pub async fn setup_ws(
     drift: DriftClient,
+    dlob: &'static DLOB,
     market_ids: Vec<MarketId>,
-    dlob_notifier: DLOBNotifier,
-    slot_tx: tokio::sync::mpsc::Sender<u64>,
-) -> impl Fn(u64) + Send + Sync + 'static {
-    move |new_slot| {
-        for market in market_ids.iter() {
-            let oracle_price_data = drift
-                .try_get_mmoracle_for_perp_market(market.index(), new_slot)
-                .unwrap();
-            dlob_notifier.slot_and_oracle_update(*market, new_slot, oracle_price_data.price as u64);
-        }
-        slot_tx.try_send(new_slot).expect("sent");
-    }
-}
+) -> (
+    tokio::sync::mpsc::Receiver<u64>,
+    WsAccountCache,
+    WsSubscriptions,
+) {
+    let dlob_notifier = dlob.spawn_notifier();
+    let user_cache = WsAccountCache::new();
 
-fn on_account_update_fn(
-    dlob_notifier: DLOBNotifier,
-    drift: DriftClient,
-) -> impl Fn(&AccountUpdate) + Send + Sync + 'static {
-    move |update| {
-        let new_user = drift_rs::utils::deser_zero_copy(update.data);
-        if let Some(ref existing) = drift
-            .backend()
-            .account_map()
-            .account_data_and_slot::<User>(&update.pubkey)
-        {
-            if existing.slot <= update.slot {
-                dlob_notifier.user_update(
-                    update.pubkey,
-                    Some(&existing.data),
-                    new_user,
-                    update.slot,
-                );
-            } else {
-                log::warn!(
-                    "out of order user update: {} > {}",
-                    existing.slot,
-                    update.slot
-                );
-            }
-        } else {
-            dlob_notifier.user_update(update.pubkey, None, new_user, update.slot);
-        }
+    let _ = tokio::try_join!(
+        sync_stats_accounts_ws(&drift, &user_cache),
+        sync_user_accounts_ws(&drift, &dlob_notifier, &user_cache),
+    );
+
+    if let Err(err) = drift.subscribe_markets(&market_ids).await {
+        log::warn!(target: TARGET, "market ws subscribe failed: {err:?}");
     }
+    if let Err(err) = drift.subscribe_oracles(&market_ids).await {
+        log::warn!(target: TARGET, "oracle ws subscribe failed: {err:?}");
+    }
+
+    let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
+
+    let ws_url = get_ws_url(drift.rpc().url().as_str()).expect("ws url");
+    let commitment = CommitmentConfig::processed();
+    let user_subscriber = WebsocketProgramAccountSubscriber::new(
+        ws_url.clone(),
+        WebsocketProgramAccountOptions {
+            filters: vec![
+                drift_rs::memcmp::get_user_filter(),
+                drift_rs::memcmp::get_non_idle_user_filter(),
+            ],
+            commitment,
+            encoding: UiAccountEncoding::Base64Zstd,
+        },
+    );
+    let user_unsub = user_subscriber.subscribe::<User, _>("filler-user", {
+        let user_cache = user_cache.clone();
+        let dlob_notifier = dlob_notifier.clone();
+        move |update| {
+            let pubkey = match Pubkey::from_str(update.pubkey.as_str()) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    log::warn!(target: TARGET, "invalid user pubkey: {err:?}");
+                    return;
+                }
+            };
+            user_cache.apply_user_update(
+                pubkey,
+                update.data_and_slot.data,
+                update.data_and_slot.slot,
+                Some(&dlob_notifier),
+            );
+        }
+    });
+
+    let stats_subscriber = WebsocketProgramAccountSubscriber::new(
+        ws_url,
+        WebsocketProgramAccountOptions {
+            filters: vec![drift_rs::memcmp::get_user_stats_filter()],
+            commitment,
+            encoding: UiAccountEncoding::Base64Zstd,
+        },
+    );
+    let stats_unsub = stats_subscriber.subscribe::<UserStats, _>("filler-user-stats", {
+        let user_cache = user_cache.clone();
+        move |update| {
+            let pubkey = match Pubkey::from_str(update.pubkey.as_str()) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    log::warn!(target: TARGET, "invalid stats pubkey: {err:?}");
+                    return;
+                }
+            };
+            user_cache.upsert_stats(pubkey, update.data_and_slot.data, update.data_and_slot.slot);
+        }
+    });
+
+    let mut slot_subscriber = SlotSubscriber::new(drift.ws());
+    if let Err(err) = slot_subscriber.subscribe({
+        let drift = drift.clone();
+        let dlob_notifier = dlob_notifier.clone();
+        let slot_tx = slot_tx.clone();
+        let market_ids = market_ids.clone();
+        move |update| {
+            let new_slot = update.latest_slot;
+            for market in market_ids.iter() {
+                match drift.try_get_mmoracle_for_perp_market(market.index(), new_slot) {
+                    Ok(oracle_price_data) => {
+                        dlob_notifier.slot_and_oracle_update(
+                            *market,
+                            new_slot,
+                            oracle_price_data.price as u64,
+                        );
+                    }
+                    Err(err) => {
+                        log::debug!(
+                            target: TARGET,
+                            "oracle price unavailable: market={}, err={err:?}",
+                            market.index()
+                        );
+                    }
+                }
+            }
+            if slot_tx.try_send(new_slot).is_err() {
+                log::debug!(target: TARGET, "slot channel full; drop slot={new_slot}");
+            }
+        }
+    }) {
+        log::warn!(target: TARGET, "slot ws subscribe failed: {err:?}");
+    }
+
+    (
+        slot_rx,
+        user_cache,
+        WsSubscriptions {
+            user_unsub,
+            stats_unsub,
+            slot_subscriber,
+        },
+    )
 }
 
 /// Try to fill a swift order
@@ -405,6 +493,7 @@ async fn try_swift_fill(
     filler_subaccount: Pubkey,
     swift_order: SignedOrderInfo,
     crosses: MakerCrosses,
+    user_cache: &WsAccountCache,
     tx_worker_ref: TxSender,
 ) {
     log::info!(target: TARGET, "try fill swift order: {}", swift_order.order_uuid_str());
@@ -412,15 +501,27 @@ async fn try_swift_fill(
     let taker_subaccount = swift_order.taker_subaccount();
     let taker_authority = swift_order.taker_authority;
 
-    let filler_account_data = drift
-        .try_get_account::<User>(&filler_subaccount)
-        .expect("filler account");
     let taker_stats = Wallet::derive_stats_account(&taker_authority);
-    let (taker_account_data, taker_stats) = tokio::try_join!(
-        drift.get_account_value::<User>(&taker_subaccount),
-        drift.get_account_value::<UserStats>(&taker_stats)
-    )
-    .unwrap();
+    let filler_account_data = match user_cache
+        .get_user_or_fetch(drift, &filler_subaccount)
+        .await
+    {
+        Ok(user) => user,
+        Err(err) => {
+            log::warn!(target: TARGET, "missing filler account: {err:?}");
+            return;
+        }
+    };
+    let (taker_account_data, taker_stats) = match tokio::try_join!(
+        user_cache.get_user_or_fetch(drift, &taker_subaccount),
+        user_cache.get_stats_or_fetch(drift, &taker_stats)
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            log::warn!(target: TARGET, "missing taker data: {err:?}");
+            return;
+        }
+    };
     let tx_builder = TransactionBuilder::new(
         drift.program_data(),
         filler_subaccount,
@@ -432,11 +533,7 @@ async fn try_swift_fill(
         .orders
         .iter()
         .filter(|m| m.0.user != taker_subaccount) // can't fill itself
-        .map(|(m, _fill_size)| {
-            drift
-                .try_get_account::<User>(&m.user)
-                .expect("maker account syncd")
-        })
+        .filter_map(|(m, _fill_size)| user_cache.get_user(&m.user))
         .collect();
 
     if maker_accounts.is_empty() && !crosses.has_vamm_cross {
@@ -488,51 +585,59 @@ async fn try_auction_fill(
     market_index: u16,
     filler_subaccount: Pubkey,
     auction_crosses: CrossesAndTopMakers,
+    user_cache: &WsAccountCache,
     tx_worker_ref: TxSender,
     oracle_update: Option<PythPriceUpdate>,
     trigger_price: u64,
     is_vamm_inactive: impl Fn(&MakerCrosses) -> bool,
 ) {
-    let filler_account_data = drift
-        .try_get_account::<User>(&filler_subaccount)
-        .expect("filler account");
+    let filler_account_data = match user_cache
+        .get_user_or_fetch(drift, &filler_subaccount)
+        .await
+    {
+        Ok(user) => user,
+        Err(err) => {
+            log::warn!(target: TARGET, "missing filler account: {err:?}");
+            return;
+        }
+    };
 
     let top_maker_asks: Vec<User> = auction_crosses
         .top_maker_asks
         .iter()
-        .map(|m| {
-            drift
-                .try_get_account::<User>(m)
-                .expect("maker account syncd")
-        })
+        .filter_map(|m| user_cache.get_user(m))
         .collect();
 
     let top_maker_bids: Vec<User> = auction_crosses
         .top_maker_bids
         .iter()
-        .map(|m| {
-            drift
-                .try_get_account::<User>(m)
-                .expect("maker account syncd")
-        })
+        .filter_map(|m| user_cache.get_user(m))
         .collect();
     let mut sent_oracle_update = false;
     for (taker_order, crosses) in auction_crosses.crosses {
         log::info!(target: TARGET, "try fill auction order: {taker_order:?}");
         let taker_subaccount = taker_order.user;
 
-        let taker_account_data = drift
-            .try_get_account::<User>(&taker_subaccount)
-            .expect("taker account");
+        let taker_account_data = match user_cache.get_user_or_fetch(drift, &taker_subaccount).await
+        {
+            Ok(user) => user,
+            Err(err) => {
+                log::warn!(target: TARGET, "missing taker account: {err:?}");
+                continue;
+            }
+        };
 
-        let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
-            &taker_account_data.authority,
-        ));
-
-        if taker_stats.is_err() {
-            log::warn!(target: TARGET, "failed to fetch taker stats: {:?}", taker_account_data.authority);
-            continue;
-        }
+        let taker_stats_pubkey = Wallet::derive_stats_account(&taker_account_data.authority);
+        let taker_stats = match user_cache
+            .get_stats_or_fetch(drift, &taker_stats_pubkey)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(err) => {
+                log::warn!(target: TARGET, "failed to fetch taker stats: {err:?}");
+                continue;
+            }
+        };
 
         let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
@@ -596,11 +701,7 @@ async fn try_auction_fill(
             .orders
             .iter()
             .filter(|m| m.0.user != taker_subaccount) // can't fill itself
-            .map(|(m, _fill_size)| {
-                drift
-                    .try_get_account::<User>(&m.user)
-                    .expect("maker account syncd")
-            })
+            .filter_map(|(m, _fill_size)| user_cache.get_user(&m.user))
             .collect();
 
         if crosses.has_vamm_cross && is_vamm_inactive(&crosses) {
@@ -624,7 +725,7 @@ async fn try_auction_fill(
             market_index,
             taker_subaccount,
             &taker_account_data,
-            &taker_stats.unwrap(),
+            &taker_stats,
             Some(taker_order.order_id),
             maker_accounts.as_slice(),
             None,
@@ -665,11 +766,16 @@ fn try_uncross(
     market_index: u16,
     filler_subaccount: Pubkey,
     crosses: CrossingRegion,
+    user_cache: &WsAccountCache,
     tx_worker_ref: &TxSender,
 ) {
-    let filler_account_data = drift
-        .try_get_account::<User>(&filler_subaccount)
-        .expect("filler account");
+    let filler_account_data = match user_cache.get_user(&filler_subaccount) {
+        Some(user) => user,
+        None => {
+            log::warn!(target: TARGET, "missing filler account for uncross");
+            return;
+        }
+    };
 
     let best_bid = &crosses.crossing_bids.first();
     let best_ask = &crosses.crossing_asks.first();
@@ -688,7 +794,7 @@ fn try_uncross(
         .filter_map(|x| {
             let maker = x.user;
             if maker != best_bid.user {
-                drift.try_get_account::<User>(&maker).ok()
+                user_cache.get_user(&maker)
             } else {
                 None
             }
@@ -702,7 +808,7 @@ fn try_uncross(
         .filter_map(|x| {
             let maker = x.user;
             if maker != best_ask.user {
-                drift.try_get_account::<User>(&maker).ok()
+                user_cache.get_user(&maker)
             } else {
                 None
             }
@@ -725,17 +831,26 @@ fn try_uncross(
 
         let taker_order_id = taker_order.order_id;
         let taker_subaccount = taker_order.user;
-        let taker_account_data = drift
-            .try_get_account::<User>(&taker_subaccount)
-            .expect("taker account");
+        let taker_account_data = match user_cache.get_user(&taker_subaccount) {
+            Some(user) => user,
+            None => {
+                log::warn!(target: TARGET, "missing taker account for uncross");
+                continue;
+            }
+        };
 
-        let taker_stats = drift.try_get_account::<UserStats>(&Wallet::derive_stats_account(
-            &taker_account_data.authority,
-        ));
-        if taker_stats.is_err() {
-            log::warn!(target: TARGET, "failed to fetch taker stats: {:?}", taker_account_data.authority);
+        let taker_stats_pubkey = Wallet::derive_stats_account(&taker_account_data.authority);
+        let taker_stats = match user_cache.get_stats(&taker_stats_pubkey) {
+            Some(stats) => stats,
+            None => {
+                log::warn!(
+                    target: TARGET,
+                    "failed to fetch taker stats: {:?}",
+                    taker_account_data.authority
+                );
             continue;
-        }
+            }
+        };
 
         let mut tx_builder = TransactionBuilder::new(
             drift.program_data(),
@@ -749,7 +864,7 @@ fn try_uncross(
                 market_index,
                 taker_subaccount,
                 &taker_account_data,
-                &taker_stats.unwrap(),
+                &taker_stats,
                 Some(taker_order_id),
                 makers.as_slice(),
                 None,
@@ -789,151 +904,6 @@ fn amm_wants_to_jit_make(amm: &AMM, taker_direction: PositionDirection) -> bool 
         }
     };
     amm_wants_to_jit_make && amm.amm_jit_intensity > 0
-}
-
-/// Setup gRPC subscriptions
-///
-/// Syncs User orders and UserStat accounts
-pub async fn setup_grpc(
-    drift: DriftClient,
-    dlob: &'static DLOB,
-    tx_worker_ref: TxSender,
-    market_ids: Vec<MarketId>,
-) -> tokio::sync::mpsc::Receiver<u64> {
-    let dlob_notifier = dlob.spawn_notifier();
-
-    let _ = tokio::try_join!(
-        sync_stats_accounts(&drift),
-        sync_user_accounts(&drift, &dlob_notifier),
-    );
-
-    let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
-
-    subscribe_grpc(drift, dlob_notifier, slot_tx, tx_worker_ref, market_ids).await;
-
-    slot_rx
-}
-
-pub async fn sync_stats_accounts(
-    drift: &DriftClient,
-) -> Result<(), solana_rpc_client_api::client_error::Error> {
-    let stats_sync_result = drift
-        .rpc()
-        .get_program_accounts_with_config(
-            &PROGRAM_ID,
-            RpcProgramAccountsConfig {
-                filters: Some(vec![drift_rs::memcmp::get_user_stats_filter()]),
-                account_config: RpcAccountInfoConfig {
-                    encoding: Some(UiAccountEncoding::Base64Zstd),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-
-    match stats_sync_result {
-        Ok(accounts) => {
-            for (pubkey, account) in accounts {
-                drift.backend().account_map().on_account_fn()(&AccountUpdate {
-                    pubkey,
-                    data: &account.data,
-                    lamports: account.lamports,
-                    owner: PROGRAM_ID,
-                    rent_epoch: u64::MAX,
-                    executable: false,
-                    slot: 0,
-                });
-            }
-            log::info!(target: "dlob", "syncd stats accounts");
-            Ok(())
-        }
-        Err(err) => {
-            log::error!(target: "dlob", "dlob sync error: {err:?}");
-            Err(err)
-        }
-    }
-}
-
-pub async fn sync_user_accounts(
-    drift: &DriftClient,
-    dlob_notifier: &DLOBNotifier,
-) -> Result<(), solana_rpc_client_api::client_error::Error> {
-    let sync_result = drift
-        .rpc()
-        .get_program_accounts_with_config(
-            &PROGRAM_ID,
-            RpcProgramAccountsConfig {
-                filters: Some(vec![
-                    drift_rs::memcmp::get_non_idle_user_filter(),
-                    drift_rs::memcmp::get_user_filter(),
-                ]),
-                account_config: RpcAccountInfoConfig {
-                    encoding: Some(UiAccountEncoding::Base64Zstd),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-
-    match sync_result {
-        Ok(accounts) => {
-            for (pubkey, account) in accounts {
-                let user: &User = drift_rs::utils::deser_zero_copy(&account.data);
-                dlob_notifier.user_update(pubkey, None, user, 0);
-                drift.backend().account_map().on_account_fn()(&AccountUpdate {
-                    pubkey,
-                    data: &account.data,
-                    lamports: account.lamports,
-                    owner: PROGRAM_ID,
-                    rent_epoch: u64::MAX,
-                    executable: false,
-                    slot: 0,
-                });
-            }
-            log::info!(target: "dlob", "synced initial orders");
-            Ok(())
-        }
-        Err(err) => {
-            log::error!(target: "dlob", "dlob sync error: {err:?}");
-            Err(err)
-        }
-    }
-}
-
-async fn subscribe_grpc(
-    drift: DriftClient,
-    dlob_notifier: DLOBNotifier,
-    slot_tx: tokio::sync::mpsc::Sender<u64>,
-    transaction_tx: TxSender,
-    market_ids: Vec<MarketId>,
-) {
-    let _res = drift
-        .grpc_subscribe(
-            std::env::var("GRPC_ENDPOINT")
-                .unwrap_or_else(|_| "https://api.rpcpool.com".to_string())
-                .into(),
-            std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN set"),
-            GrpcSubscribeOpts::default()
-                .commitment(solana_sdk::commitment_config::CommitmentLevel::Processed)
-                .usermap_on()
-                .statsmap_on()
-                .transaction_include_accounts(vec![drift.wallet().default_sub_account()])
-                .on_transaction(on_transaction_update_fn(transaction_tx.clone()))
-                .on_slot(on_slot_update_fn(
-                    drift.clone(),
-                    market_ids,
-                    dlob_notifier.clone(),
-                    slot_tx.clone(),
-                ))
-                .on_account(
-                    AccountFilter::partial().with_discriminator(User::DISCRIMINATOR),
-                    on_account_update_fn(dlob_notifier.clone(), drift.clone()),
-                ),
-            true,
-        )
-        .await;
 }
 
 pub enum TxWork {

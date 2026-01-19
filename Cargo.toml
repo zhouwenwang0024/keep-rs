@@ -13,6 +13,7 @@ anchor-lang = "0.32.1"
 axum = "0.8"
 clap = { version = "4.5.40", "features" = ["env", "derive"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+dashmap = "6"
 dotenv = "0.15.0"
 drift-rs = { git = "https://github.com/drift-labs/drift-rs", branch = "trunk/isolated-positions", features = ["unsafe_pub", "titan"] }
 env_logger = "0.11"

@@ -5,6 +5,7 @@ mod filler;
 mod http;
 mod liquidator;
 mod util;
+mod ws_cache;
 
 use crate::{
     filler::FillerBot,
@@ -147,6 +148,9 @@ async fn main() {
         async move {
             let _ = tokio::signal::ctrl_c().await;
             log::warn!("ctrl+c received, bot shutting down...");
+            if let Err(err) = drift.unsubscribe().await {
+                log::warn!("ws unsubscribe failed: {err:?}");
+            }
             drift.grpc_unsubscribe();
             std::process::exit(0);
         }
