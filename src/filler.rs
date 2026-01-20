@@ -10,6 +10,7 @@ use drift_rs::{
     dlob::{CrossesAndTopMakers, CrossingRegion, MakerCrosses, OrderKind, TakerOrder, DLOB},
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
+    math::constants::{BASE_PRECISION_U64, QUOTE_PRECISION_U64},
     priority_fee_subscriber::PriorityFeeSubscriber,
     slot_subscriber::SlotSubscriber,
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
@@ -42,6 +43,9 @@ use crate::{
 };
 
 const TARGET: &str = "filler";
+const MIN_NOTIONAL_USD: u64 = 100;
+const MAKER_FEE_BPS: u64 = 1;
+const BPS_DENOMINATOR: u64 = 10_000;
 
 struct WsSubscriptions {
     user_unsub: UnsubHandle,
@@ -256,18 +260,47 @@ impl FillerBot {
                             let taker_order = TakerOrder::from_order_params(order_params, price);
                             let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(&perp_market), None);
                             if !crosses.is_empty() {
-                                log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
-                                let pf = priority_fee_subscriber.priority_fee_nth(0.3);
-                                try_swift_fill(
-                                    drift,
-                                    pf,
-                                    config.swift_cu_limit,
-                                    filler_subaccount,
-                                    signed_order,
-                                    crosses,
-                                    &user_cache,
-                                    tx_worker_ref.clone(),
-                                ).await;
+                                let maker_price = crosses
+                                    .orders
+                                    .first()
+                                    .map(|(order, _)| order.price)
+                                    .or_else(|| {
+                                        if crosses.has_vamm_cross {
+                                            Some(vamm_price)
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                let maker_post_only = crosses
+                                    .orders
+                                    .first()
+                                    .map(|(order, _)| order.is_post_only())
+                                    .unwrap_or(false);
+                                let maker_count = u64::from(maker_post_only || crosses.has_vamm_cross);
+                                let fillable_base = calc_fillable_base(taker_order.size, &crosses);
+                                if let Some(maker_price) = maker_price {
+                                    let buy_price = maker_price.min(taker_order.price);
+                                    let sell_price = maker_price.max(taker_order.price);
+                                    if cross_meets_thresholds(
+                                        buy_price,
+                                        sell_price,
+                                        fillable_base,
+                                        maker_count,
+                                    ) {
+                                        log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
+                                        let pf = priority_fee_subscriber.priority_fee_nth(0.3);
+                                        try_swift_fill(
+                                            drift,
+                                            pf,
+                                            config.swift_cu_limit,
+                                            filler_subaccount,
+                                            signed_order,
+                                            crosses,
+                                            &user_cache,
+                                            tx_worker_ref.clone(),
+                                        ).await;
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -325,6 +358,45 @@ impl FillerBot {
 
                         let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), None);
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
+                        crosses_and_top_makers.crosses.retain(|(taker_order, maker_crosses)| {
+                            let vamm_price = if taker_order.is_long() {
+                                perp_market.ask_price(None)
+                            } else {
+                                perp_market.bid_price(None)
+                            };
+                            let maker_price = maker_crosses
+                                .orders
+                                .first()
+                                .map(|(order, _)| order.price)
+                                .or_else(|| {
+                                    if maker_crosses.has_vamm_cross {
+                                        Some(vamm_price)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            let maker_post_only = maker_crosses
+                                .orders
+                                .first()
+                                .map(|(order, _)| order.is_post_only())
+                                .unwrap_or(false);
+                            let maker_count =
+                                u64::from(maker_post_only || maker_crosses.has_vamm_cross);
+                            let fillable_base =
+                                calc_fillable_base(taker_order.size, maker_crosses);
+                            let maker_price = match maker_price {
+                                Some(price) => price,
+                                None => return false,
+                            };
+                            let buy_price = maker_price.min(taker_order.price);
+                            let sell_price = maker_price.max(taker_order.price);
+                            cross_meets_thresholds(
+                                buy_price,
+                                sell_price,
+                                fillable_base,
+                                maker_count,
+                            )
+                        });
 
                         if !crosses_and_top_makers.crosses.is_empty() {
                             log::info!(target: TARGET, "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
@@ -411,6 +483,38 @@ impl FillerBot {
         drift.grpc_unsubscribe();
         log::info!(target: TARGET, "filler shutting down...");
     }
+}
+
+fn calc_fillable_base(taker_size: u64, maker_crosses: &MakerCrosses) -> u64 {
+    let maker_total: u64 = maker_crosses.orders.iter().map(|(_, size)| *size).sum();
+    if maker_total == 0 {
+        taker_size
+    } else {
+        taker_size.min(maker_total)
+    }
+}
+
+fn calc_cross_bps(buy_price: u64, sell_price: u64) -> u64 {
+    if buy_price == 0 || sell_price <= buy_price {
+        return 0;
+    }
+    let spread = sell_price - buy_price;
+    ((spread as u128) * (BPS_DENOMINATOR as u128) / (buy_price as u128)) as u64
+}
+
+fn cross_meets_thresholds(buy_price: u64, sell_price: u64, base: u64, maker_count: u64) -> bool {
+    if buy_price == 0 || base == 0 {
+        return false;
+    }
+    let notional_quote =
+        (base as u128) * (buy_price as u128) / (BASE_PRECISION_U64 as u128);
+    let min_notional_quote = (MIN_NOTIONAL_USD as u128) * (QUOTE_PRECISION_U64 as u128);
+    if notional_quote < min_notional_quote {
+        return false;
+    }
+    let cross_bps = calc_cross_bps(buy_price, sell_price);
+    let fee_bps = maker_count.saturating_mul(MAKER_FEE_BPS);
+    cross_bps.saturating_sub(fee_bps) > 0
 }
 
 fn spawn_swift_reconnect(
@@ -912,6 +1016,14 @@ fn try_uncross(
 
     let best_bid = best_bid.unwrap();
     let best_ask = best_ask.unwrap();
+
+    let buy_price = best_bid.price.min(best_ask.price);
+    let sell_price = best_bid.price.max(best_ask.price);
+    let fillable_base = best_bid.size.min(best_ask.size);
+    let maker_count = u64::from(best_bid.is_post_only()) + u64::from(best_ask.is_post_only());
+    if !cross_meets_thresholds(buy_price, sell_price, fillable_base, maker_count) {
+        return;
+    }
 
     let maker_asks: Vec<User> = crosses
         .crossing_asks
