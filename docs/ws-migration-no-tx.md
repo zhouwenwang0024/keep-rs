@@ -160,7 +160,7 @@ WS 只提供增量更新。为了避免冷启动缺数据，仍建议保留：
    - 建议断线后触发 `sync_user_accounts` 再构建 DLOB
 
 2) **缓存一致性**  
-   - User 更新必须先更新 `user_cache`，再更新 DLOB  
+   - User 更新必须先用旧值更新 DLOB，再覆盖 `user_cache`  
    - 不要同时保留 `account_map` + `GlobalUserMap`（内存翻倍）
 
 3) **放弃回执后的 pending 堆积**  

@@ -1,4 +1,4 @@
-//! Filler Bot
+//! 补单机器人
 use std::{
     collections::BTreeMap,
     str::FromStr,
@@ -7,10 +7,7 @@ use std::{
 };
 
 use drift_rs::{
-    dlob::{
-        CrossesAndTopMakers, CrossingRegion, DLOBNotifier, MakerCrosses, OrderKind, TakerOrder,
-        DLOB,
-    },
+    dlob::{CrossesAndTopMakers, CrossingRegion, MakerCrosses, OrderKind, TakerOrder, DLOB},
     event_subscriber::DriftEvent,
     ffi::calculate_auction_price,
     priority_fee_subscriber::PriorityFeeSubscriber,
@@ -79,7 +76,7 @@ impl FillerBot {
             UseMarkets::All => drift.get_all_perp_market_ids(),
             UseMarkets::Subset(m) => m,
         };
-        // remove bet perp markets
+        // 移除 bet 永续市场
         market_ids.retain(|x| {
             let market = drift
                 .program_data()
@@ -127,7 +124,7 @@ impl FillerBot {
             log::warn!(target: TARGET, "failed to warm filler account: {err:?}");
         }
 
-        // pyth disabled for now
+        // pyth 订阅
         let pyth_access_token = std::env::var("PYTH_LAZER_TOKEN").expect("pyth access token");
         let pyth_feed_cli = pyth_lazer_client::LazerClient::new(
             "wss://pyth-lazer.dourolabs.app/v1/stream",
@@ -155,7 +152,8 @@ impl FillerBot {
     }
 
     pub async fn run(self) {
-        let mut swift_order_stream = self.swift_order_stream;
+        let mut swift_order_stream = Some(self.swift_order_stream);
+        let mut swift_reconnect_task: Option<tokio::task::JoinHandle<SwiftOrderStream>> = None;
         let mut slot_rx = self.slot_rx;
         let mut limiter = self.limiter;
         let drift: &'static DriftClient = Box::leak(Box::new(self.drift));
@@ -171,16 +169,24 @@ impl FillerBot {
             .state_account()
             .map(|s| s.has_median_trigger_price_feature())
             .unwrap_or(false);
-        let mut pyth_price_feed = self.pyth_price_feed;
+        let mut pyth_price_feed = Some(self.pyth_price_feed);
+        let mut pyth_reconnect_task: Option<
+            tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<PythPriceUpdate>>,
+        > = None;
         let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
 
         loop {
             tokio::select! {
                 biased;
-                swift_order = swift_order_stream.next() => {
+                swift_order = async {
+                    match swift_order_stream.as_mut() {
+                        Some(stream) => stream.next().await,
+                        None => None,
+                    }
+                }, if swift_order_stream.is_some() => {
                     match swift_order {
                         Some(signed_order) => {
-                            // try swift fill against resting liquidity
+                            // 尝试用 swift 订单吃掉挂单流动性
                             let mut order_params = signed_order.order_params();
                             log::info!(target: TARGET, "new swift order. uuid={}, market={}", signed_order.order_uuid_str(), order_params.market_index);
                             log::debug!(target: TARGET, "details: {signed_order:?}");
@@ -251,7 +257,7 @@ impl FillerBot {
                             let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(&perp_market), None);
                             if !crosses.is_empty() {
                                 log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
-                                let pf = priority_fee_subscriber.priority_fee_nth(0.6);
+                                let pf = priority_fee_subscriber.priority_fee_nth(0.3);
                                 try_swift_fill(
                                     drift,
                                     pf,
@@ -265,19 +271,42 @@ impl FillerBot {
                             }
                         }
                         None => {
-                            log::error!(target: TARGET, "swift order stream finished");
-                            break;
+                            log::warn!(target: TARGET, "swift order stream finished; scheduling reconnect");
+                            swift_order_stream = None;
+                            if swift_reconnect_task.is_none() {
+                                swift_reconnect_task = Some(spawn_swift_reconnect(drift, market_ids.clone()));
+                            }
                         }
+                    }
+                }
+                swift_reconnect = async {
+                    if let Some(task) = swift_reconnect_task.as_mut() {
+                        Some(task.await)
+                    } else {
+                        None
+                    }
+                }, if swift_reconnect_task.is_some() => {
+                    match swift_reconnect {
+                        Some(Ok(stream)) => {
+                            swift_order_stream = Some(stream);
+                            swift_reconnect_task = None;
+                            log::info!(target: TARGET, "swift order stream reconnected");
+                        }
+                        Some(Err(err)) => {
+                            swift_reconnect_task = Some(spawn_swift_reconnect(drift, market_ids.clone()));
+                            log::warn!(target: TARGET, "swift reconnect task failed: {err:?}");
+                        }
+                        None => {}
                     }
                 }
                 new_slot = slot_rx.recv() => {
                     slot = new_slot.expect("got slot update");
 
-                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // add entropy to produce unique tx hash on conseuctive tx resubmission
+                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // 增加随机性，避免连续重提导致交易哈希重复
                     let t0 = std::time::SystemTime::now();
                     let unix_now = t0.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
 
-                    // check for auction and limit crosses in all markets
+                    // 检查所有市场的拍卖/限价可成交
                     for market in &market_ids {
                         let market_index = market.index();
 
@@ -316,7 +345,7 @@ impl FillerBot {
                             ).await;
                         }
 
-                        // ghetto rate limit
+                        // 简易限速
                         if slot % 2 == 0 {
                             if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
                                 log::info!(target: TARGET, "found limit crosses (market: {market_index})");
@@ -324,26 +353,54 @@ impl FillerBot {
                             }
                         }
 
-                        // check state config ~every minute
+                        // 大约每分钟检查一次状态配置
                         if slot % 300 == 0 {
                             use_median_trigger_price = drift
                             .state_account()
-                            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice
+                            .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice 功能位
                             .unwrap_or(false);
                         }
                     }
                     let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
                     log::trace!(target: TARGET, "⏱️ checked fills at {slot}: {:?}ms", duration);
                 }
-                new_price = pyth_price_feed.recv() => {
+                new_price = async {
+                    match pyth_price_feed.as_mut() {
+                        Some(feed) => feed.recv().await,
+                        None => None,
+                    }
+                }, if pyth_price_feed.is_some() => {
                     match new_price {
                         Some(update) => {
                             pyth_oracle_prices.insert(update.market_id, update);
                         }
                         None => {
-                            log::error!(target: TARGET, "pyth price feed disconnected, shutting down");
-                            break;  // exits the loop
+                            log::warn!(target: TARGET, "pyth price feed disconnected; scheduling reconnect");
+                            pyth_price_feed = None;
+                            if pyth_reconnect_task.is_none() {
+                                pyth_reconnect_task = Some(spawn_pyth_reconnect(market_ids.clone()));
+                            }
                         }
+                    }
+                }
+                pyth_reconnect = async {
+                    if let Some(task) = pyth_reconnect_task.as_mut() {
+                        Some(task.await)
+                    } else {
+                        None
+                    }
+                }, if pyth_reconnect_task.is_some() => {
+                    match pyth_reconnect {
+                        Some(Ok(feed)) => {
+                            pyth_price_feed = Some(feed);
+                            pyth_reconnect_task = None;
+                            log::info!(target: TARGET, "pyth price feed reconnected");
+                        }
+                        Some(Err(err)) => {
+                            pyth_reconnect_task = Some(spawn_pyth_reconnect(market_ids.clone()));
+                            log::warn!(target: TARGET, "pyth reconnect task failed: {err:?}");
+                        }
+                        None => {}
                     }
                 }
             }
@@ -356,9 +413,78 @@ impl FillerBot {
     }
 }
 
-/// Setup WS subscriptions
+fn spawn_swift_reconnect(
+    drift: &'static DriftClient,
+    market_ids: Vec<MarketId>,
+) -> tokio::task::JoinHandle<SwiftOrderStream> {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            match drift
+                .subscribe_swift_orders(&market_ids, Some(true), None, None)
+                .await
+            {
+                Ok(stream) => {
+                    return stream;
+                }
+                Err(err) => {
+                    log::warn!(
+                        target: TARGET,
+                        "swift resubscribe failed: {err:?}, retry in {backoff_secs}s"
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(30);
+        }
+    })
+}
+
+fn spawn_pyth_reconnect(
+    market_ids: Vec<MarketId>,
+) -> tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<PythPriceUpdate>> {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            let pyth_access_token = match std::env::var("PYTH_LAZER_TOKEN") {
+                Ok(token) => token,
+                Err(err) => {
+                    log::warn!(
+                        target: TARGET,
+                        "pyth token missing: {err:?}, retry in {backoff_secs}s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(30);
+                    continue;
+                }
+            };
+
+            match pyth_lazer_client::LazerClient::new(
+                "wss://pyth-lazer.dourolabs.app/v1/stream",
+                pyth_access_token.as_str(),
+            ) {
+                Ok(cli) => {
+                    let feed = crate::util::subscribe_price_feeds(cli, &market_ids, &[]);
+                    return feed;
+                }
+                Err(err) => {
+                    log::warn!(
+                        target: TARGET,
+                        "pyth reconnect failed: {err:?}, retry in {backoff_secs}s"
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(30);
+        }
+    })
+}
+
+/// 设置 WS 订阅
 ///
-/// Syncs User orders and UserStat accounts
+/// 同步 User 订单与 UserStat 账户
 pub async fn setup_ws(
     drift: DriftClient,
     dlob: &'static DLOB,
@@ -485,7 +611,7 @@ pub async fn setup_ws(
     )
 }
 
-/// Try to fill a swift order
+/// 尝试成交一笔 swift 订单
 async fn try_swift_fill(
     drift: &'static DriftClient,
     priority_fee: u64,
@@ -532,7 +658,7 @@ async fn try_swift_fill(
     let maker_accounts: Vec<User> = crosses
         .orders
         .iter()
-        .filter(|m| m.0.user != taker_subaccount) // can't fill itself
+        .filter(|m| m.0.user != taker_subaccount) // 不能自己成交自己
         .filter_map(|(m, _fill_size)| user_cache.get_user(&m.user))
         .collect();
 
@@ -541,7 +667,7 @@ async fn try_swift_fill(
         return;
     }
 
-    // let taker_order_id = taker_account_data.next_order_id;
+    // taker_order_id = taker_account_data.next_order_id;
     let mut tx_builder = tx_builder
         .with_priority_fee(priority_fee, Some(cu_limit))
         .place_swift_order(&swift_order, &taker_account_data)
@@ -550,12 +676,12 @@ async fn try_swift_fill(
             taker_subaccount,
             &taker_account_data,
             &taker_stats,
-            None, // Some(taker_order_id), // assuming we're fast enough that its the taker_order_id, should be ok for retail
+            None, // Some(taker_order_id), // 假设足够快，认为就是 taker_order_id，对零售用户可接受
             maker_accounts.as_slice(),
             Some(swift_order.has_builder()),
         );
 
-    // large accounts list, bump CU limit to compensate
+    // 账户列表较大，提高 CU 上限补偿
     if let Some(ix) = tx_builder.ixs().last() {
         if ix.accounts.len() >= 30 {
             tx_builder = tx_builder.set_ix(
@@ -575,9 +701,9 @@ async fn try_swift_fill(
     );
 }
 
-/// Try to fill an auction order
+/// 尝试成交一笔拍卖订单
 ///
-/// - `auction_crosses` list of one or more crosses to fill
+/// - `auction_crosses` 为一个或多个可成交撮合
 async fn try_auction_fill(
     drift: &'static DriftClient,
     priority_fee: u64,
@@ -700,7 +826,7 @@ async fn try_auction_fill(
         let mut maker_accounts: Vec<User> = crosses
             .orders
             .iter()
-            .filter(|m| m.0.user != taker_subaccount) // can't fill itself
+            .filter(|m| m.0.user != taker_subaccount) // 不能自己成交自己
             .filter_map(|(m, _fill_size)| user_cache.get_user(&m.user))
             .collect();
 
@@ -731,7 +857,7 @@ async fn try_auction_fill(
             None,
         );
 
-        // large accounts list, bump CU limit to compensate
+        // 账户列表较大，提高 CU 上限补偿
         if let Some(ix) = tx_builder.ixs().last() {
             if ix.accounts.len() >= 20 {
                 tx_builder = tx_builder.set_ix(
@@ -755,9 +881,9 @@ async fn try_auction_fill(
     }
 }
 
-/// Try to uncross top of book
+/// 尝试解撮合盘口顶部
 ///
-/// - `crosses` list of one or more crosses to fill
+/// - `crosses` 为一个或多个可成交撮合
 fn try_uncross(
     drift: &DriftClient,
     slot: u64,
@@ -823,7 +949,7 @@ fn try_uncross(
         crosses.crossing_bids
     );
 
-    // try valid combinations of taker/maker with all crossing asks/bids
+    // 用所有交叉的挂单尝试组合合法的 taker/maker
     for (taker_order, makers) in [(best_ask, maker_bids), (best_bid, maker_asks)] {
         if taker_order.is_post_only() {
             continue;
@@ -870,7 +996,7 @@ fn try_uncross(
                 None,
             );
 
-        // large accounts list, bump CU limit to compensate
+        // 账户列表较大，提高 CU 上限补偿
         if let Some(ix) = tx_builder.ixs().last() {
             if ix.accounts.len() >= 40 {
                 tx_builder = tx_builder.set_ix(
@@ -1011,7 +1137,7 @@ impl TxWorker {
         });
     }
     fn confirm_tx(&self, rt: &Handle, tx: Signature) {
-        // TODO: if CU limit is too low send it again with higher amount
+        // TODO: CU 上限过低时用更高值重发
         log::debug!(target: TARGET, "txworker confirm tx: {tx:?}");
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
@@ -1049,7 +1175,7 @@ impl TxWorker {
                     if let Some(meta) = tx_log.transaction.meta {
                         match meta.err {
                             None => {
-                                // tx confirmed ok
+                                // 交易确认成功
                                 let sig = tx.to_string();
                                 let logs = meta.log_messages.unwrap();
                                 let tx_confirmed_slot = tx_log.slot;
@@ -1136,7 +1262,7 @@ impl TxWorker {
                             }
                             Some(err) => {
                                 log::warn!(target: TARGET, "tx failed: {err:?}");
-                                // tx failed with error
+                                // 交易失败
                                 metrics
                                     .tx_failed
                                     .with_label_values(&[
