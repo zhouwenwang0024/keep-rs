@@ -356,7 +356,15 @@ impl FillerBot {
                             }
                         }
 
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(market_index, MarketType::Perp, slot, oracle_price, Some(&perp_market), None);
+                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(
+                            market_index,
+                            MarketType::Perp,
+                            slot,
+                            oracle_price,
+                            Some(&perp_market),
+                            trigger_price,
+                            None,
+                        );
                         crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
                         crosses_and_top_makers.crosses.retain(|(taker_order, maker_crosses)| {
                             let vamm_price = if taker_order.is_long() {
