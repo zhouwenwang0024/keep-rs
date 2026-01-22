@@ -63,7 +63,7 @@
     - 自动补齐用户持仓 market/oracle/quote  
     - makers 的 user/stats  
     - 我方推荐人（基于 `taker_stats.is_referred()`）  
-    - Swift 的 revenue share escrow（可选，基于 taker authority）  
+    - Swift 的 revenue share escrow（可选，基于 taker authority，**始终追加在最后**）  
 
 - `ProxyArbPerpIx`  
   - 本地构造代理指令数据  
