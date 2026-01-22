@@ -2,8 +2,10 @@
 use std::sync::Arc;
 
 mod filler;
+mod filler_trades;
 mod http;
 mod liquidator;
+mod tx_worker;
 mod util;
 mod ws_cache;
 
