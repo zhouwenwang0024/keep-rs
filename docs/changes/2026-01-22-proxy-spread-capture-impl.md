@@ -10,7 +10,7 @@
 - 代理程序负责失败筛选与回滚  
 - 我方账户作为主 accounts；原 taker 进入 makers  
 - 保留拍卖触发单逻辑（`trigger_order`）  
-- Swift 路径仅保留 `place_swift_order`，不再参与 revenue 相关构造  
+- Swift 路径仍保留 `place_swift_order`，并在 `has_builder` 时追加 revenue share escrow  
 
 ---
 
@@ -25,6 +25,7 @@
   - `fill_perp_order` → `proxy_spread_capture`  
   - 将 taker 的 `User` **加入 makers**（保证代理端可见）  
   - 传入 **filler 的 `UserStats`** 以追加我方推荐人账户  
+  - 若 `swift_order.has_builder()` 为真，追加 taker authority 对应的 revenue share escrow  
 
 - `try_auction_fill`：  
   - **保留 `trigger_order`**（不修改）  
@@ -40,7 +41,7 @@
 **说明**
 
 - 原逻辑不会把 taker 加入 makers；本次明确加入以满足“我方=主账户，原 taker 作为对手侧”的新结构  
-- 未再使用 `swift_order.has_builder()`，因为代理路径不需要 revenue share escrow  
+- Swift 路径在 `has_builder` 时追加 revenue share escrow（taker authority）  
 
 ---
 
@@ -62,6 +63,7 @@
     - 自动补齐用户持仓 market/oracle/quote  
     - makers 的 user/stats  
     - 我方推荐人（基于 `taker_stats.is_referred()`）  
+    - Swift 的 revenue share escrow（可选，基于 taker authority）  
 
 - `ProxyArbPerpIx`  
   - 本地构造代理指令数据  
@@ -73,6 +75,7 @@
   - 构造代理主 accounts  
   - 构造 remaining_accounts（手工复刻逻辑）  
   - 指令 program_id **硬编码**为 `Ecx5sm34EyesW26hiYT8KYnZJT5E79Arm6RHXX2e5c4x`  
+  - 额外参数：`revenue_share_authority`（仅 Swift 路径传入 taker authority）  
 
 ---
 
@@ -82,9 +85,8 @@
 - **触发单逻辑保留**：`try_auction_fill` 的 `trigger_order` 未改动  
 - **taker 进入 makers**：原 taker 作为对手侧账户传入代理  
 - **推荐人**：基于 **filler stats** 追加我方推荐人账户  
-- **不再使用 has_builder**：Swift 的 builder 标志不影响代理路径构造  
+- **Swift 的 has_builder**：仅影响 revenue share escrow，Swift 路径追加（taker authority）  
 - **remaining_accounts 不再调用 build_accounts**：避免错误引入 Drift 主 accounts  
-- **Swift 的 has_builder**：旧逻辑仅影响 revenue share escrow，代理路径不需要，已移除  
 
 ---
 
@@ -100,3 +102,4 @@
 - 编译 `keep-rs` 与 `drift-rs`  
 - 发送一笔测试交易，确认代理端 `arb_perp` 的 remaining_accounts 解析顺序与权限  
 - 若代理程序新增/减少所需账户，需同步更新 `build_remaining_accounts_for_proxy`
+- **Swift escrow 兼容性**：`arb_perp` 里 `load_user_maps` 会消费所有 remaining_accounts，需确认追加 escrow 不会破坏 user/stats 配对；必要时在代理程序内单独解析 escrow

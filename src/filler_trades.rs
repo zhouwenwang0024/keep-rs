@@ -75,6 +75,11 @@ pub(crate) async fn try_swift_fill(
     maker_accounts.push(taker_account_data);
 
     // taker_order_id = taker_account_data.next_order_id;
+    let revenue_share_authority = if swift_order.has_builder() {
+        Some(taker_account_data.authority)
+    } else {
+        None
+    };
     let mut tx_builder = tx_builder
         .with_priority_fee(priority_fee, Some(cu_limit))
         .place_swift_order(&swift_order, &taker_account_data)
@@ -82,6 +87,7 @@ pub(crate) async fn try_swift_fill(
             taker_order.market_index,
             &filler_stats,
             maker_accounts.as_slice(),
+            revenue_share_authority,
         );
 
     // 账户列表较大，提高 CU 上限补偿
@@ -255,6 +261,7 @@ pub(crate) async fn try_auction_fill(
             market_index,
             &filler_stats,
             maker_accounts.as_slice(),
+            None,
         );
 
         // 账户列表较大，提高 CU 上限补偿
@@ -391,7 +398,7 @@ pub(crate) fn try_uncross(
         makers.push(taker_account_data);
         tx_builder = tx_builder
             .with_priority_fee(priority_fee, Some(cu_limit))
-            .proxy_spread_capture(market_index, &filler_stats, makers.as_slice());
+            .proxy_spread_capture(market_index, &filler_stats, makers.as_slice(), None);
 
         // 账户列表较大，提高 CU 上限补偿
         if let Some(ix) = tx_builder.ixs().last() {
