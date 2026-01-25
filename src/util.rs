@@ -145,9 +145,9 @@ impl TxIntent {
             }
             TxIntent::SwiftFill { maker_crosses, .. } => {
                 if maker_crosses.has_vamm_cross {
-                    "swift_fill"
-                } else {
                     "swift_fill_vamm"
+                } else {
+                    "swift_fill"
                 }
             }
             TxIntent::OnchainCross { .. } => "onchain_cross",
