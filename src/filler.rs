@@ -2,15 +2,15 @@
 use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
 use drift_rs::{
-    dlob::{L3Order, MakerCrosses, DLOB},
+    dlob::{CrossingRegionAll, L3Order, MakerCrosses, DLOB},
     ffi::calculate_auction_price,
     priority_fee_subscriber::PriorityFeeSubscriber,
     slot_subscriber::SlotSubscriber,
     swift_order_subscriber::SwiftOrderStream,
     types::{
         accounts::{User, UserStats},
-        CommitmentConfig, MarketId, MarketStatus, MarketType, Order, OrderType,
-        PositionDirection, PostOnlyParam, UnsubHandle,
+        CommitmentConfig, MarketId, MarketStatus, MarketType, Order, OrderType, PositionDirection,
+        PostOnlyParam, UnsubHandle,
     },
     utils::get_ws_url,
     websocket_program_account_subscriber::{
@@ -18,6 +18,7 @@ use drift_rs::{
     },
     DriftClient, Pubkey,
 };
+use drift_rs::types::MarketPrecision;
 use futures_util::StreamExt;
 use solana_account_decoder_client_types::UiAccountEncoding;
 
@@ -261,12 +262,17 @@ impl FillerBot {
                                 price,
                                 CROSS_DEPTH,
                             );
+                            let crosses = filter_swift_crosses_reduce_only(
+                                crosses,
+                                order_params.market_index,
+                                &user_cache,
+                            );
                             if !crosses.is_empty() {
                                 let maker_crosses = MakerCrosses {
                                     has_vamm_cross: false,
                                     orders: crosses
                                         .into_iter()
-                                        .map(|order| (order, order.size))
+                                        .map(|order| (order.clone(), order.size))
                                         .collect(),
                                     slot: slot + 1,
                                     is_partial: false,
@@ -349,6 +355,16 @@ impl FillerBot {
                             CROSS_DEPTH,
                         );
                         if let Some(crosses) = crosses {
+                            let crosses = match filter_crosses_reduce_only(
+                                crosses,
+                                market_index,
+                                &user_cache,
+                                &perp_market,
+                                oracle_price,
+                            ) {
+                                Some(crosses) => crosses,
+                                None => continue,
+                            };
                             let allow_bid = limiter.allow_event(slot, crosses.best_bid.order_id);
                             let allow_ask = limiter.allow_event(slot, crosses.best_ask.order_id);
                             if allow_bid || allow_ask {
@@ -491,6 +507,129 @@ fn collect_swift_crosses(
     }
 
     crosses
+}
+
+fn is_invalid_reduce_only(
+    order: &L3Order,
+    market_index: u16,
+    user_cache: &WsAccountCache,
+) -> bool {
+    if !order.is_reduce_only() {
+        return false;
+    }
+
+    let user = match user_cache.get_user(&order.user) {
+        Some(user) => user,
+        None => return false,
+    };
+    let base_asset_amount = user
+        .perp_positions
+        .iter()
+        .find(|pos| pos.market_index == market_index)
+        .map(|pos| pos.base_asset_amount)
+        .unwrap_or(0);
+
+    if base_asset_amount == 0 {
+        return true;
+    }
+    if base_asset_amount > 0 && order.is_long() {
+        return true;
+    }
+    if base_asset_amount < 0 && !order.is_long() {
+        return true;
+    }
+
+    false
+}
+
+fn filter_swift_crosses_reduce_only(
+    crosses: Vec<L3Order>,
+    market_index: u16,
+    user_cache: &WsAccountCache,
+) -> Vec<L3Order> {
+    crosses
+        .into_iter()
+        .filter(|order| !is_invalid_reduce_only(order, market_index, user_cache))
+        .collect()
+}
+
+fn filter_crosses_reduce_only(
+    crosses: CrossingRegionAll,
+    market_index: u16,
+    user_cache: &WsAccountCache,
+    perp_market: &drift_rs::types::accounts::PerpMarket,
+    oracle_price: u64,
+) -> Option<CrossingRegionAll> {
+    let crossing_bids: Vec<L3Order> = crosses
+        .crossing_bids
+        .into_iter()
+        .filter(|order| !is_invalid_reduce_only(order, market_index, user_cache))
+        .collect();
+    let crossing_asks: Vec<L3Order> = crosses
+        .crossing_asks
+        .into_iter()
+        .filter(|order| !is_invalid_reduce_only(order, market_index, user_cache))
+        .collect();
+
+    if crossing_bids.is_empty() || crossing_asks.is_empty() {
+        return None;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let auction_slot = crosses.slot.saturating_add(1);
+    let effective_price = |order: &L3Order, is_bid: bool| -> u64 {
+        if let Some(price) = order.post_trigger_price(auction_slot, oracle_price, perp_market) {
+            return price;
+        }
+        if order.price == 0 {
+            let dir = if is_bid {
+                PositionDirection::Long
+            } else {
+                PositionDirection::Short
+            };
+            if let Ok(vamm_price) = perp_market.fallback_price(
+                dir,
+                oracle_price as i64,
+                order.max_ts.saturating_sub(now) as i64,
+            ) {
+                return vamm_price;
+            }
+        }
+        order.price
+    };
+
+    let best_bid = crossing_bids[0].clone();
+    let best_ask = crossing_asks[0].clone();
+    let best_bid_price = effective_price(&best_bid, true);
+    let best_ask_price = effective_price(&best_ask, false);
+
+    if best_bid_price < best_ask_price {
+        return None;
+    }
+
+    let crossing_bids: Vec<L3Order> = crossing_bids
+        .into_iter()
+        .filter(|b| effective_price(b, true) >= best_ask_price)
+        .collect();
+    let crossing_asks: Vec<L3Order> = crossing_asks
+        .into_iter()
+        .filter(|a| effective_price(a, false) <= best_bid_price)
+        .collect();
+
+    if crossing_bids.is_empty() || crossing_asks.is_empty() {
+        return None;
+    }
+
+    Some(CrossingRegionAll {
+        slot: crosses.slot,
+        best_bid,
+        best_ask,
+        crossing_bids,
+        crossing_asks,
+    })
 }
 
 fn spawn_swift_reconnect(

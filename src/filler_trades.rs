@@ -92,6 +92,7 @@ pub(crate) async fn try_swift_fill(
         false,
     )
     .with_priority_fee(priority_fee, Some(base_cu));
+    tx_builder = tx_builder.update_amms(vec![taker_order.market_index]);
 
     let mut seen_triggers = HashSet::<(Pubkey, u32)>::new();
     for (order, _fill_size) in crosses.orders.iter() {
@@ -222,6 +223,7 @@ pub(crate) async fn try_onchain_cross(
         tx_builder = tx_builder
             .post_pyth_lazer_oracle_update(&[update_msg.feed_id], &update_msg.message);
     }
+    tx_builder = tx_builder.update_amms(vec![market_index]);
 
     let mut maker_accounts: Vec<User> = Vec::new();
     let mut seen = HashSet::<Pubkey>::new();
