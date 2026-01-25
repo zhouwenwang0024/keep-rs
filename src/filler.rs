@@ -2,16 +2,15 @@
 use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
 use drift_rs::{
-    dlob::{CrossesAndTopMakers, CrossingRegion, MakerCrosses, OrderKind, TakerOrder, DLOB},
+    dlob::{L3Order, MakerCrosses, DLOB},
     ffi::calculate_auction_price,
-    math::constants::{BASE_PRECISION_U64, QUOTE_PRECISION_U64},
     priority_fee_subscriber::PriorityFeeSubscriber,
     slot_subscriber::SlotSubscriber,
     swift_order_subscriber::SwiftOrderStream,
     types::{
         accounts::{User, UserStats},
-        CommitmentConfig, MarketId, MarketPrecision, MarketStatus, MarketType, Order, OrderType,
-        PositionDirection, PostOnlyParam, UnsubHandle, AMM,
+        CommitmentConfig, MarketId, MarketStatus, MarketType, Order, OrderType,
+        PositionDirection, PostOnlyParam, UnsubHandle,
     },
     utils::get_ws_url,
     websocket_program_account_subscriber::{
@@ -21,21 +20,18 @@ use drift_rs::{
 };
 use futures_util::StreamExt;
 use solana_account_decoder_client_types::UiAccountEncoding;
-use tokio::sync::RwLock;
 
 use crate::{
-    filler_trades::{try_auction_fill, try_swift_fill, try_uncross},
+    filler_trades::{try_onchain_cross, try_swift_fill},
     http::Metrics,
     tx_worker::{TxSender, TxWorker},
-    util::{OrderSlotLimiter, PythPriceUpdate, TxIntent},
+    util::{OrderSlotLimiter, PythPriceUpdate},
     ws_cache::{sync_stats_accounts_ws, sync_user_accounts_ws, WsAccountCache},
     Config, UseMarkets,
 };
 
 pub(crate) const TARGET: &str = "filler";
-const MIN_NOTIONAL_USD: u64 = 100;
-const MAKER_FEE_BPS: u64 = 1;
-const BPS_DENOMINATOR: u64 = 10_000;
+const CROSS_DEPTH: usize = 3;
 
 struct WsSubscriptions {
     user_unsub: UnsubHandle,
@@ -247,50 +243,48 @@ impl FillerBot {
                                     unreachable!();
                                 }
                             };
-                            let taker_order = TakerOrder::from_order_params(order_params, price);
-                            let crosses = dlob.find_crosses_for_taker_order(slot + 1, oracle_price as u64, taker_order, Some(&perp_market), None);
+                            let unix_now = std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+                            let trigger_price = perp_market
+                                .get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price)
+                                .unwrap_or(oracle_price as u64);
+                            let crosses = collect_swift_crosses(
+                                dlob,
+                                order_params.market_index,
+                                MarketType::Perp,
+                                oracle_price as u64,
+                                &perp_market,
+                                trigger_price,
+                                order_params.direction,
+                                price,
+                                CROSS_DEPTH,
+                            );
                             if !crosses.is_empty() {
-                                let maker_price = crosses
-                                    .orders
-                                    .first()
-                                    .map(|(order, _)| order.price)
-                                    .or_else(|| {
-                                        if crosses.has_vamm_cross {
-                                            Some(vamm_price)
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                let maker_post_only = crosses
-                                    .orders
-                                    .first()
-                                    .map(|(order, _)| order.is_post_only())
-                                    .unwrap_or(false);
-                                let maker_count = u64::from(maker_post_only || crosses.has_vamm_cross);
-                                let fillable_base = calc_fillable_base(taker_order.size, &crosses);
-                                if let Some(maker_price) = maker_price {
-                                    let buy_price = maker_price.min(taker_order.price);
-                                    let sell_price = maker_price.max(taker_order.price);
-                                    if cross_meets_thresholds(
-                                        buy_price,
-                                        sell_price,
-                                        fillable_base,
-                                        maker_count,
-                                    ) {
-                                        log::info!(target: TARGET, "found resting cross. crosses={crosses:?}");
-                                        let pf = priority_fee_subscriber.priority_fee_nth(0.3);
-                                        try_swift_fill(
-                                            drift,
-                                            pf,
-                                            config.swift_cu_limit,
-                                            filler_subaccount,
-                                            signed_order,
-                                            crosses,
-                                            &user_cache,
-                                            tx_worker_ref.clone(),
-                                        ).await;
-                                    }
-                                }
+                                let maker_crosses = MakerCrosses {
+                                    has_vamm_cross: false,
+                                    orders: crosses
+                                        .into_iter()
+                                        .map(|order| (order, order.size))
+                                        .collect(),
+                                    slot: slot + 1,
+                                    is_partial: false,
+                                    taker_direction: order_params.direction,
+                                };
+                                log::info!(target: TARGET, "found swift cross. crosses={maker_crosses:?}");
+                                let pf = priority_fee_subscriber.priority_fee_nth(0.3);
+                                try_swift_fill(
+                                    drift,
+                                    pf,
+                                    config.swift_cu_limit,
+                                    filler_subaccount,
+                                    signed_order,
+                                    maker_crosses,
+                                    trigger_price,
+                                    &user_cache,
+                                    tx_worker_ref.clone(),
+                                ).await;
                             }
                         }
                         None => {
@@ -346,84 +340,34 @@ impl FillerBot {
                             }
                         }
 
-                        let mut crosses_and_top_makers = dlob.find_crosses_for_auctions(
+                        let crosses = dlob.find_crossing_region_all_types(
+                            oracle_price,
                             market_index,
                             MarketType::Perp,
-                            slot,
-                            oracle_price,
                             Some(&perp_market),
                             trigger_price,
-                            None,
+                            CROSS_DEPTH,
                         );
-                        crosses_and_top_makers.crosses.retain(|(o, _)| limiter.allow_event(slot, o.order_id));
-                        crosses_and_top_makers.crosses.retain(|(taker_order, maker_crosses)| {
-                            let vamm_price = if taker_order.is_long() {
-                                perp_market.ask_price(None)
-                            } else {
-                                perp_market.bid_price(None)
-                            };
-                            let maker_price = maker_crosses
-                                .orders
-                                .first()
-                                .map(|(order, _)| order.price)
-                                .or_else(|| {
-                                    if maker_crosses.has_vamm_cross {
-                                        Some(vamm_price)
-                                    } else {
-                                        None
-                                    }
-                                });
-                            let maker_post_only = maker_crosses
-                                .orders
-                                .first()
-                                .map(|(order, _)| order.is_post_only())
-                                .unwrap_or(false);
-                            let maker_count =
-                                u64::from(maker_post_only || maker_crosses.has_vamm_cross);
-                            let fillable_base =
-                                calc_fillable_base(taker_order.size, maker_crosses);
-                            let maker_price = match maker_price {
-                                Some(price) => price,
-                                None => return false,
-                            };
-                            let buy_price = maker_price.min(taker_order.price);
-                            let sell_price = maker_price.max(taker_order.price);
-                            cross_meets_thresholds(
-                                buy_price,
-                                sell_price,
-                                fillable_base,
-                                maker_count,
-                            )
-                        });
-
-                        if !crosses_and_top_makers.crosses.is_empty() {
-                            log::info!(target: TARGET, "found auction crosses. market: {},{crosses_and_top_makers:?}", market.index());
-                            try_auction_fill(
-                                drift,
-                                priority_fee,
-                                config.fill_cu_limit,
-                                market_index,
-                                filler_subaccount,
-                                crosses_and_top_makers,
-                                &user_cache,
-                                tx_worker_ref.clone(),
-                                pyth_update,
-                                trigger_price,
-                                move |maker_cross| {
-                                    perp_market.has_too_much_drawdown() && amm_wants_to_jit_make(&perp_market.amm, maker_cross.taker_direction)
-                                },
-                            ).await;
-                        }
-
-                        // 简易限速
-                        if slot % 2 == 0 {
-                            if let Some(crosses) = dlob.find_crossing_region(oracle_price, market_index, MarketType::Perp, Some(&perp_market)) {
-                                log::info!(target: TARGET, "found limit crosses (market: {market_index})");
-                                try_uncross(drift, slot + 1, priority_fee, config.fill_cu_limit, market_index, filler_subaccount, crosses, &user_cache, &tx_worker_ref);
+                        if let Some(crosses) = crosses {
+                            let allow_bid = limiter.allow_event(slot, crosses.best_bid.order_id);
+                            let allow_ask = limiter.allow_event(slot, crosses.best_ask.order_id);
+                            if allow_bid || allow_ask {
+                                log::info!(target: TARGET, "found onchain crosses. market: {},{crosses:?}", market.index());
+                                try_onchain_cross(
+                                    drift,
+                                    priority_fee,
+                                    config.fill_cu_limit,
+                                    market_index,
+                                    filler_subaccount,
+                                    crosses,
+                                    &user_cache,
+                                    tx_worker_ref.clone(),
+                                    pyth_update,
+                                    trigger_price,
+                                ).await;
                             }
                         }
 
-                        // 大约每分钟检查一次状态配置
                         if slot % 300 == 0 {
                             use_median_trigger_price = drift
                             .state_account()
@@ -483,41 +427,70 @@ impl FillerBot {
     }
 }
 
-fn calc_fillable_base(taker_size: u64, maker_crosses: &MakerCrosses) -> u64 {
-    let maker_total: u64 = maker_crosses.orders.iter().map(|(_, size)| *size).sum();
-    if maker_total == 0 {
-        taker_size
-    } else {
-        taker_size.min(maker_total)
-    }
-}
+fn collect_swift_crosses(
+    dlob: &DLOB,
+    market_index: u16,
+    market_type: MarketType,
+    oracle_price: u64,
+    perp_market: &drift_rs::types::accounts::PerpMarket,
+    trigger_price: u64,
+    direction: PositionDirection,
+    taker_price: u64,
+    depth: usize,
+) -> Vec<L3Order> {
+    let book = dlob.get_l3_snapshot(market_index, market_type);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let effective_price = |order: &L3Order| -> u64 {
+        if let Some(price) = order.post_trigger_price(book.slot, oracle_price, perp_market) {
+            return price;
+        }
+        if order.price == 0 {
+            let dir = if order.is_long() {
+                PositionDirection::Long
+            } else {
+                PositionDirection::Short
+            };
+            if let Ok(vamm_price) = perp_market.fallback_price(
+                dir,
+                oracle_price as i64,
+                order.max_ts.saturating_sub(now) as i64,
+            ) {
+                return vamm_price;
+            }
+        }
+        order.price
+    };
+    let mut crosses = Vec::new();
 
-fn calc_cross_bps(buy_price: u64, sell_price: u64) -> u64 {
-    if buy_price == 0 || sell_price <= buy_price {
-        return 0;
+    match direction {
+        PositionDirection::Long => {
+            for ask in book.asks(Some(oracle_price), Some(perp_market), Some(trigger_price)) {
+                if effective_price(ask) > taker_price {
+                    break;
+                }
+                crosses.push(ask.clone());
+                if crosses.len() >= depth {
+                    break;
+                }
+            }
+        }
+        PositionDirection::Short => {
+            for bid in book.bids(Some(oracle_price), Some(perp_market), Some(trigger_price)) {
+                if effective_price(bid) < taker_price {
+                    break;
+                }
+                crosses.push(bid.clone());
+                if crosses.len() >= depth {
+                    break;
+                }
+            }
+        }
     }
-    let spread = sell_price - buy_price;
-    ((spread as u128) * (BPS_DENOMINATOR as u128) / (buy_price as u128)) as u64
-}
 
-pub(crate) fn cross_meets_thresholds(
-    buy_price: u64,
-    sell_price: u64,
-    base: u64,
-    maker_count: u64,
-) -> bool {
-    if buy_price == 0 || base == 0 {
-        return false;
-    }
-    let notional_quote =
-        (base as u128) * (buy_price as u128) / (BASE_PRECISION_U64 as u128);
-    let min_notional_quote = (MIN_NOTIONAL_USD as u128) * (QUOTE_PRECISION_U64 as u128);
-    if notional_quote < min_notional_quote {
-        return false;
-    }
-    let cross_bps = calc_cross_bps(buy_price, sell_price);
-    let fee_bps = maker_count.saturating_mul(MAKER_FEE_BPS);
-    cross_bps.saturating_sub(fee_bps) > 0
+    crosses
 }
 
 fn spawn_swift_reconnect(
@@ -716,17 +689,4 @@ pub async fn setup_ws(
             slot_subscriber,
         },
     )
-}
-
-
-fn amm_wants_to_jit_make(amm: &AMM, taker_direction: PositionDirection) -> bool {
-    let amm_wants_to_jit_make = match taker_direction {
-        PositionDirection::Long => {
-            amm.base_asset_amount_with_amm.as_i128() < -(amm.order_step_size as i128)
-        }
-        PositionDirection::Short => {
-            amm.base_asset_amount_with_amm.as_i128() > amm.order_step_size as i128
-        }
-    };
-    amm_wants_to_jit_make && amm.amm_jit_intensity > 0
 }

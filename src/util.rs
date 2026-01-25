@@ -103,6 +103,10 @@ pub enum TxIntent {
     SwiftFill {
         maker_crosses: MakerCrosses,
     },
+    OnchainCross {
+        slot: u64,
+        market_index: u16,
+    },
     VAMMTakerFill {
         slot: u64,
         market_index: u16,
@@ -146,6 +150,7 @@ impl TxIntent {
                     "swift_fill_vamm"
                 }
             }
+            TxIntent::OnchainCross { .. } => "onchain_cross",
             TxIntent::LimitUncross { .. } => "limit_uncross",
             TxIntent::VAMMTakerFill { .. } => "vamm_taker",
             TxIntent::LiquidateWithFill { .. } => "liq_with_fill",
@@ -162,6 +167,7 @@ impl TxIntent {
             TxIntent::SwiftFill { maker_crosses, .. } => {
                 maker_crosses.orders.len() + if maker_crosses.has_vamm_cross { 1 } else { 0 }
             }
+            TxIntent::OnchainCross { .. } => 1,
             TxIntent::VAMMTakerFill { .. } => 1,
             TxIntent::LimitUncross { .. } => 1,
             TxIntent::LiquidateWithFill { .. } => 1,
@@ -186,6 +192,7 @@ impl TxIntent {
             TxIntent::SwiftFill { maker_crosses, .. } => {
                 (maker_crosses.orders.to_vec(), maker_crosses.slot)
             }
+            TxIntent::OnchainCross { slot, .. } => (vec![], *slot),
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),
             Self::LiquidateWithFill { slot, .. } => (vec![], *slot),
@@ -199,6 +206,7 @@ impl TxIntent {
             | Self::LimitUncross { slot, .. }
             | Self::LiquidateWithFill { slot, .. }
             | Self::LiquidateSpot { slot, .. } => Some(*slot),
+            Self::OnchainCross { slot, .. } => Some(*slot),
             _ => None,
         }
     }
