@@ -244,6 +244,12 @@ impl FillerBot {
                                     unreachable!();
                                 }
                             };
+                            let vamm_min_order = perp_market.amm.min_order_size;
+                            let has_vamm_cross = order_params.base_asset_amount > vamm_min_order
+                                && match order_params.direction {
+                                    PositionDirection::Long => price > vamm_price,
+                                    PositionDirection::Short => price < vamm_price,
+                                };
                             let unix_now = std::time::SystemTime::now()
                                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                 .unwrap()
@@ -267,9 +273,9 @@ impl FillerBot {
                                 order_params.market_index,
                                 &user_cache,
                             );
-                            if !crosses.is_empty() {
+                            if !crosses.is_empty() || has_vamm_cross {
                                 let maker_crosses = MakerCrosses {
-                                    has_vamm_cross: false,
+                                    has_vamm_cross,
                                     orders: crosses
                                         .into_iter()
                                         .map(|order| (order.clone(), order.size))
