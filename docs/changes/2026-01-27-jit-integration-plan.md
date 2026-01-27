@@ -96,25 +96,22 @@ keep-rs/
   src/
     jit/
       mod.rs
-      feed_binance.rs      # 外部价格源（可替换）
+      feed_binance.rs      # 外部价格源（Binance WS）
       maker_select.rs      # 基于 DLOB 的 maker 选择
       jit_strategy.rs      # JIT 逻辑（cooldown + 触发 + params）
       jit_trades.rs        # 构建并发送 jit 指令
 ```
 
 ### 3.2 外部价格源
-- 定义 trait：
-  - `trait ExternalPriceFeed { fn latest_fair_px(market) -> Option<i64>; }`
-- 实现：
-  - 版本 A：Binance WS（与测试项目一致）。
-  - 版本 B：HTTP 报价 / 聚合服务（作为 fallback）。
+- 仅使用 **Binance WS**（与测试项目一致），不提供 HTTP fallback。
+- 触发由 **futures tick** 驱动，spot 仅更新缓存，不触发输出。
 
 ### 3.3 Maker 选择（基于 DLOB）
 - 从 DLOB L3 snapshot 中提取 best bid/ask 价位。
 - 在该价位选最多 `max_makers_per_side` 个 maker（同价位）；可直接用 L3Order 的 user 列表。
 - Reduce-Only 过滤：
   - 复用 keep 里已有的 RO 判断逻辑（与 `filter_crosses_reduce_only` 一致）。
-- 可选：过滤拍卖订单或 Trigger 未触发订单（与链上逻辑对齐）。
+- 过滤拍卖订单或 Trigger 未触发订单（与链上逻辑对齐）。
 
 ### 3.4 JIT 触发逻辑（策略）
 - 输入：
@@ -141,7 +138,7 @@ keep-rs/
 
 ### 3.6 与 filler 主循环的融合点（单机器人）
 - 在 `FillerBot::run` 内部新增 JIT 子任务：
-  - 独立的价格流（Binance/HTTP）更新共享的 `jit_price_cache`。
+  - 独立的价格流（Binance WS）更新共享的 `jit_price_cache`。
   - 独立的策略调度（cooldown + side 选择）从 DLOB 取 best bid/ask + makers。
   - 通过 `TxWorker` 发送 JIT 交易（与 Swift/onchain 共享发送管道）。
 - 复用已有的 `WsAccountCache` 与 `DLOB`，不新增重复订阅。
@@ -246,7 +243,6 @@ keep-rs/
 ## 5. keep 配置建议
 
 在 `Config` 中新增：
-- `jit_enabled: bool`
 - `arb_sub_account_id: u8`（默认 0，用于 `arb_perp`）
 - `jit_sub_account_id: u8`（默认 1，用于 `jit`）
 - `jit_edge_ppm: i64`
@@ -254,7 +250,6 @@ keep-rs/
 - `jit_cooldown_ms: u64`
 - `jit_markets: Vec<u16>`
 - `jit_proxy_program_id: Pubkey`
-- `jit_external_feed: enum { Binance, Http, None }`
 
 ---
 
@@ -263,7 +258,7 @@ keep-rs/
 ### 6.1 任务拆分（更细粒度）
 1) SDK：新增 JIT 账户构造 + discriminator + proxy_jit 方法。
 2) keep：新增 `jit_trades.rs`（仅发送，不含策略）。
-3) keep：新增 `jit_price_cache` 与外部行情订阅（Binance/HTTP）。
+3) keep：新增 `jit_price_cache` 与外部行情订阅（Binance WS）。
 4) keep：新增 `maker_select.rs`（DLOB 选价位 + maker 列表）。
 5) keep：新增 `jit_strategy.rs`（cooldown + side 决策）。
 6) 配置与指标：增加 jit_* 配置与 metrics 埋点。
@@ -281,7 +276,7 @@ keep-rs/
    - cooldown + side 选择 + edge 判定。
 
 ### 阶段 C：外部价格源
-1) Binance WS 订阅实现（或先用 HTTP 轮询版）。
+1) Binance WS 订阅实现。
 2) 将外部价格接入 JIT 策略。
 
 ### 阶段 D：稳定性与监控
@@ -352,7 +347,7 @@ keep-rs/
   - 维护 Jito UUID 列表，轮询使用（round-robin）。
   - 发送 Jito 的交易附加 tip 指令（小费），RPC 通道不加 tip。
   - 同一笔交易同时投递到 Jito 与 RPC，允许任一路成功。
-  - 可选：提供 `simulateBundle` 预模拟开关。
+  - 不提供 `simulateBundle` 预模拟开关。
 - 参考实现：`C:\Users\Administrator\Desktop\fsdownload\测试1\send2.py` 中的 `_pick_jito_uuid`、`_send_bundle_base64`、`_send_business_ix` 逻辑。
 
 ---
@@ -583,7 +578,156 @@ keep-rs/
 - `L2BOOKNEW2.py` → `maker_select.rs`（best price + makers_at_price）。
 - `main1.py` → `FillerBot::run` 内的 JIT 子任务启动逻辑。
 
+---
 
+## 19. 新增要求与优化方案（本轮落地）
 
+### 19.1 使用 Binance WS 获取 reference_price
+**目标**：reference_price 采用 **Binance Spot + USD-M Futures 加权 mid**，与测试程序一致。  
+**方案**：
+- keep 侧新增 `jit/feed_binance.rs`，每个市场同时连接：
+  - spot：`wss://stream.binance.com:9443/ws/{symbol}@bookTicker`
+  - futures：`wss://fstream.binance.com/ws/{symbol}@bookTicker`
+- **事件驱动只用 futures 更新触发**：spot 仅更新缓存，不触发输出；futures tick 才产生事件。
+- 加权 mid：`mid = 0.8 * spot_mid + 0.2 * fut_mid`（与测试程序一致）。
+- 将 `mid` 转成 Drift `PRICE_PRECISION`（`*1_000_000`）写入 `jit_price_cache`（此时为“binance_mid”）。
+- 维持 `staleness_ms` 约束（spot/fut 任一过期则不触发）。
+- symbol 由 perp 市场名派生（`SOL-PERP` → `SOLUSDC`），无法映射的市场跳过并日志提示。
 
+### 19.2 CU 上限：基础 *3
+**目标**：将“基础 CU 上限”从 `*2` 提升到 `*3`。  
+**方案**：
+- `base_cu = cu_limit * 3`（swift/onchain/jit 统一调整）。
+- 当账户数过大时，额外上限使用 `base_cu * 3`。
 
+### 19.3 CU price /10
+**目标**：实际支付的 compute unit price 缩小 10 倍。  
+**方案**：
+- 在 filler 中统一缩放 `priority_fee_subscriber.priority_fee_nth(..) / 10`。
+- 确保 swift / onchain / jit 统一缩放，避免策略间不一致。
+
+### 19.4 提速：降低对 slot 驱动的依赖
+**问题**：仅 slot 驱动会错过短周期机会。  
+**方案（不破坏结构）**：
+- 保留 slot 分支作为主循环，但**新增事件驱动触发**：
+  - Binance WS 价格更新 → 直接触发 `JitStrategy::maybe_intent`。
+  - DLOB/WS 用户更新 → 更新 maker 结构与 best price（必要时触发快速检查）。
+- 限流依旧由 `cooldown_ms` 控制，避免过载。
+**收益**：减少延迟、避免等到下一 slot。
+
+### 19.5 事件驱动 + 5ms 窗口
+**目标**：所有策略以事件驱动为主，并用统一 5ms 窗口做去重/节流。  
+**方案**：
+- book/ws 事件触发 onchain cross 检查时，使用固定 `EVENT_WINDOW_MS=5` 去重。
+- binance 事件触发 jit 时，同样使用 5ms 窗口去重。
+- 不再依赖 `fast_check_ms` 配置；窗口固定为 5ms。
+
+### 19.6 加入“基差”修正
+**目标**：参考价引入基差（与测试程序一致）。  
+**方案**：
+- 在 JIT 策略层引入 basis EMA：`spread = binance_mid - drift_mid`，每秒更新 EMA。
+- 参考价采用 `ref = binance_mid - 0.8 * basis_ema`，再用于 edge 判定与发送。
+
+### 19.7 默认并行运行（不再用配置开关）
+**目标**：arb 与 jit 默认同跑，不依赖 `jit_enabled` 开关。  
+**方案**：
+- filler 内部始终创建 JIT 子任务与订阅（若 symbol 映射为空则自动空转）。
+- `jit_enabled` 保留字段但不再作为启动条件。
+
+### 19.8 落地 Jito + RPC 并发发送
+**目标**：像 `send2.py` 一样同时发 Jito + RPC，Jito 附带小费且轮询 UUID。  
+**方案**：
+- TxWorker 内并行发送：RPC（原 tx）+ Jito（tip_tx + business_tx bundle）。
+- Jito UUID 从 `JITO_UUIDS/JITO_UUID1/JITO_UUID2/JITO_UUID` 读取并轮询。
+- tip 参数：`JITO_TIP_ACCOUNT/JITO_TIP_LAMPORTS`（默认 tip account + 10k lamports）。
+
+---
+
+## 20. 深度检查：当前实现的潜在问题与修正方向
+
+> 以下基于已落地的 keep + SDK 改动做一次“结构性体检”，用于提前发现可能的 BUG/偏差。
+
+### 20.1 Binance 参考价链路与测试程序差距
+- **基差 EMA 的 mid 选择**：允许使用 DLOB L3 的 best bid/ask mid（不需要重构 DLOB，只需取头部价格）。  
+  **风险**：若 L3 计算代价过高或带拍卖价偏移，基差会抖动。  
+  **建议**：继续用 L3 mid，但保证仅取 top-of-book，不全量遍历。
+- **缺少 vol EMA → edge_ppm 动态阈值**：测试程序用 `fair_vol_bps` 作为 threshold，且 clamp 到 `EDGE_PPM_MIN/MAX`。  
+  **风险**：固定 edge_ppm 在低波时浪费机会、高波时误触发。  
+  **建议**：加入可选“动态阈值模式”（vol/bps → ppm），配置开关控制。
+- **缺少 warmup 期**：测试程序启动 180s 内不触发。  
+  **风险**：启动初期数据未稳定时误触发。  
+  **建议**：新增 `jit_warmup_ms`，默认 0，可按需要开启。
+- **官方 L2 与本地 L2 的语义**：测试程序用 official L2 仅做 basis，机会判断仍使用本地 drift L2。  
+  **建议**：保持当前“DLOB/L3 仅用于机会判定”的结构，但补充 official L2 仅用于 basis（避免双口径冲突）。
+
+### 20.2 Maker 选择与触发价格路径
+- **拍卖/触发价 slot 偏差**：`best_levels_with_makers()` 使用 `book.slot` 作为 `post_trigger_price` 的 slot。  
+  **风险**：与链上 `slot+1` 计价不同，触发价可能偏保守/偏激进。  
+  **建议**：引入 `auction_slot = book.slot + 1`（或传入显式 slot），与链上逻辑对齐。
+- **maker 列表含 taker**：当前在 `jit_trades.rs` 才剔除 taker，`maker_select` 仍可能产生 taker。  
+  **风险**：列表增大、重复统计、日志误导。  
+  **建议**：在 `maker_select` 中增加可选 `taker_pubkey` 过滤。
+- **maker 列表同时包含 bid/ask**：当前 JIT 发送时把两侧 makers 合并。  
+  **风险**：remaining_accounts 过大，且 jit-proxy 若只用单侧可能白白增加失败概率。  
+  **建议**：若 jit-proxy 明确只需要单侧 makers，则在策略中选择 side 并只传该侧。
+
+### 20.3 事件驱动与节流
+- **book 事件触发依赖 slot**：`book_rx` 触发时仍使用上一次 `slot` 与 oracle 数据。  
+  **风险**：在 slot 未刷新前的瞬时窗口内可能因 oracle slot 不一致而跳过机会。  
+  **建议**：增加 “slot>0 且 oracle 可用” 的软门槛；必要时使用 `latest_slot` 作为触发 slot。
+- **事件驱动窗口固定 5ms**：不再提供 `fast_check_ms` 配置。  
+  **风险**：窗口过小可能带来 CPU/WS 抢占与过密 RPC。  
+  **建议**：固定 5ms，并结合冷却与去重窗口控制负载。
+
+### 20.5 基差 EMA 更新频率与时间对齐
+- **EMA 更新应按秒而非事件数**：测试程序只在 `now_sec` 变化时更新 EMA。  
+  **建议**：事件触发时检查 `now_sec != last_basis_sec` 才更新 EMA。
+- **binance 与 DLOB 时间对齐**：只要 binance tick 与本次 L3 mid 的时间差 <= 500ms 即可。  
+  **建议**：引入 `BASIS_ALIGN_MAX_MS=500`，超过则不触发 JIT。
+
+### 20.4 JIT 指令层
+- **参考价精度**：必须保证写入的是 `PRICE_PRECISION=1e6`。  
+  **风险**：价格精度错位将导致 edge 判定失败。  
+  **建议**：在 feed 层与策略层统一断言/日志打印（如 ref_px < 1e4 即报警）。
+- **binance symbol 与 endpoint**：当前使用 `stream.binance.com` + `fstream.binance.com`。  
+  **风险**：USDC 交易对是否都在 USDⓈ-M（fstream）需确认；如在 COIN-M 则需要 `dapi.binance.com`。  
+  **建议**：对每个 symbol 做一次“订阅成功 + 首包校验”，失败则降级或切换 endpoint。
+
+---
+
+## 21. 与测试程序的“细节差异清单”
+
+### 21.1 价格模型差异（关键）
+- **测试程序**：spot/futures 加权 + basis EMA 修正 + vol EMA 动态阈值 → `edge_ppm`，并 clamp 300~500ppm。
+- **当前实现**：仅 spot/futures 加权 mid；`edge_ppm` 固定配置；无 basis/vol。
+
+### 21.2 机会判定差异
+- **测试程序**：机会判定使用本地 L2（L2Book top2_cache），并受 drift_ok 影响。
+- **当前实现**：使用 DLOB L3 best bid/ask（含触发价计算）作为机会判断来源。
+- **影响**：L2 与 L3 的聚合规则不同，可能出现“测试程序认为有机会但 keep 不触发”或反之。
+
+### 21.3 触发与限流差异
+- **测试程序**：cooldown 按 **side** 维度（BUY/SELL）独立；并允许无限 in-flight。
+- **当前实现**：cooldown 按 **market** 维度；并通过 TxWorker 队列自然限流。
+- **影响**：在双向频繁机会场景，触发频率与测试程序不同。
+
+### 21.4 Maker 选择与剩余账户差异
+- **测试程序**：只给“有效 side”提供 makers；另一侧可为空。
+- **当前实现**：合并 bid/ask makers 一起送入 JIT proxy。
+- **影响**：remaining_accounts 体积更大，可能降低成功率或增加 CU。
+
+### 21.5 参考价源差异
+- **测试程序**：使用官方 L2 WS 修正 basis，且有 warmup 期。
+- **当前实现**：无 official L2 参与，且无 warmup。
+- **影响**：启动初期和结构性偏差时更容易误触发。
+
+### 21.6 交易发送通道差异
+- **测试程序**：Jito + RPC 双通道发送，带 UUID 轮询与 tip。
+- **当前实现**：Jito + RPC 双通道并发发送（已落地）。
+
+### 21.7 建议的对齐清单（如需尽量一致）
+1) 补 basis EMA + vol EMA（优先）。
+2) 引入 side 选择与 per-side cooldown。
+3) makers 仅保留有效 side；降低 RA 体积。
+4) 增加 warmup 与 drift_ok 约束。
+5) 落地 Jito + RPC 并发发送（已完成）。

@@ -25,6 +25,7 @@ use solana_account_decoder_client_types::UiAccountEncoding;
 use crate::{
     filler_trades::{try_onchain_cross, try_swift_fill},
     http::Metrics,
+    jit::{feed_binance::spawn_binance_price_feed, jit_trades::try_jit, JitStrategy},
     tx_worker::{TxSender, TxWorker},
     util::{OrderSlotLimiter, PythPriceUpdate},
     ws_cache::{sync_stats_accounts_ws, sync_user_accounts_ws, WsAccountCache},
@@ -33,6 +34,7 @@ use crate::{
 
 pub(crate) const TARGET: &str = "filler";
 const CROSS_DEPTH: usize = 3;
+const EVENT_WINDOW_MS: u64 = 5;
 
 struct WsSubscriptions {
     user_unsub: UnsubHandle,
@@ -44,7 +46,10 @@ pub struct FillerBot {
     drift: DriftClient,
     dlob: &'static DLOB,
     filler_subaccount: Pubkey,
+    jit_subaccount: Pubkey,
+    jit_symbols: Vec<(u16, String)>,
     slot_rx: tokio::sync::mpsc::Receiver<u64>,
+    book_rx: tokio::sync::mpsc::Receiver<()>,
     swift_order_stream: SwiftOrderStream,
     limiter: OrderSlotLimiter<40>,
     market_ids: Vec<MarketId>,
@@ -96,6 +101,19 @@ impl FillerBot {
         let priority_fee_subscriber = priority_fee_subscriber.subscribe();
 
         let filler_subaccount = drift.wallet.sub_account(config.sub_account_id);
+        let jit_subaccount = drift.wallet.sub_account(config.jit_sub_account_id);
+        let jit_symbols = market_ids
+            .iter()
+            .filter_map(|m| {
+                let market = drift
+                    .program_data()
+                    .perp_market_config_by_index(m.index())
+                    .ok()?;
+                let name = core::str::from_utf8(&market.name).ok()?;
+                let symbol = binance_symbol_from_name(name)?;
+                Some((m.index(), symbol))
+            })
+            .collect();
 
         log::info!(target: TARGET, "subscribing swift orders");
         let swift_order_stream = drift
@@ -105,7 +123,7 @@ impl FillerBot {
         log::info!(target: TARGET, "subscribed swift orders");
 
         drift.subscribe_blockhashes().await.expect("subscribed");
-        let (slot_rx, user_cache, ws_subscriptions) =
+        let (slot_rx, book_rx, user_cache, ws_subscriptions) =
             setup_ws(drift.clone(), dlob, market_ids.clone()).await;
         log::info!(target: TARGET, "subscribed ws");
         if let Err(err) = user_cache
@@ -113,6 +131,9 @@ impl FillerBot {
             .await
         {
             log::warn!(target: TARGET, "failed to warm filler account: {err:?}");
+        }
+        if let Err(err) = user_cache.get_user_or_fetch(&drift, &jit_subaccount).await {
+            log::warn!(target: TARGET, "failed to warm jit account: {err:?}");
         }
 
         // pyth 订阅
@@ -129,7 +150,10 @@ impl FillerBot {
             drift,
             dlob,
             filler_subaccount,
+            jit_subaccount,
+            jit_symbols,
             slot_rx,
+            book_rx,
             swift_order_stream,
             limiter: OrderSlotLimiter::new(),
             market_ids,
@@ -146,11 +170,14 @@ impl FillerBot {
         let mut swift_order_stream = Some(self.swift_order_stream);
         let mut swift_reconnect_task: Option<tokio::task::JoinHandle<SwiftOrderStream>> = None;
         let mut slot_rx = self.slot_rx;
+        let mut book_rx = self.book_rx;
         let mut limiter = self.limiter;
         let drift: &'static DriftClient = Box::leak(Box::new(self.drift));
         let dlob = self.dlob;
         let market_ids = self.market_ids;
         let filler_subaccount = self.filler_subaccount;
+        let jit_subaccount = self.jit_subaccount;
+        let jit_symbols = self.jit_symbols;
         let config = self.config.clone();
         let tx_worker_ref = self.tx_worker_ref.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
@@ -165,6 +192,31 @@ impl FillerBot {
             tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<PythPriceUpdate>>,
         > = None;
         let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
+        let mut jit_strategy = Some(JitStrategy::new(
+            config.jit_edge_ppm,
+            config.jit_cooldown_ms,
+            config.jit_price_stale_ms,
+            config.jit_max_makers_per_side,
+        ));
+        let mut jit_price_cache = BTreeMap::<u16, (i64, u64)>::new();
+        let jit_proxy_program_id = if config.jit_proxy_program_id.trim().is_empty() {
+            None
+        } else {
+            match Pubkey::from_str(config.jit_proxy_program_id.trim()) {
+                Ok(pk) => Some(pk),
+                Err(err) => {
+                    log::warn!(target: TARGET, "invalid jit proxy program id: {err:?}");
+                    None
+                }
+            }
+        };
+        let mut binance_feed = if !jit_symbols.is_empty() {
+            Some(spawn_binance_price_feed(jit_symbols))
+        } else {
+            None
+        };
+        let mut last_book_event_ms: u64 = 0;
+        let mut last_binance_event_ms: u64 = 0;
 
         loop {
             tokio::select! {
@@ -285,7 +337,7 @@ impl FillerBot {
                                     taker_direction: order_params.direction,
                                 };
                                 log::info!(target: TARGET, "found swift cross. crosses={maker_crosses:?}");
-                                let pf = priority_fee_subscriber.priority_fee_nth(0.3);
+                                let pf = scale_priority_fee(priority_fee_subscriber.priority_fee_nth(0.3));
                                 try_swift_fill(
                                     drift,
                                     pf,
@@ -330,75 +382,152 @@ impl FillerBot {
                 }
                 new_slot = slot_rx.recv() => {
                     slot = new_slot.expect("got slot update");
-
-                    let priority_fee = priority_fee_subscriber.priority_fee_nth(0.5) + slot % 2; // 增加随机性，避免连续重提导致交易哈希重复
-                    let t0 = std::time::SystemTime::now();
-                    let unix_now = t0.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
-
-                    // 检查所有市场的拍卖/限价可成交
-                    for market in &market_ids {
-                        let market_index = market.index();
-
-                        let perp_market = drift.try_get_perp_market_account(market_index).expect("got perp market");
-                        let chain_oracle_data = drift.try_get_mmoracle_for_perp_market(market_index, slot).expect("got oracle price");
-                        log::debug!(target: "oracle", "oracle price: delay:{:?},market:{:?},oracle:{:?},amm:{:?}", chain_oracle_data.delay, market, chain_oracle_data.price, perp_market.amm.mm_oracle_price);
-                        let mut oracle_price = chain_oracle_data.price as u64;
-                        let trigger_price = perp_market.get_trigger_price(oracle_price as i64, unix_now, use_median_trigger_price).unwrap_or(oracle_price);
-                        let mut pyth_update = None;
-                        if let Some(p) = pyth_oracle_prices.get(&market_index) {
-                            if oracle_price != p.price {
-                                oracle_price = p.price;
-                                pyth_update = Some(p.clone());
-                            }
-                        }
-
-                        let crosses = dlob.find_crossing_region_all_types(
-                            oracle_price,
-                            market_index,
-                            MarketType::Perp,
-                            Some(&perp_market),
-                            trigger_price,
-                            CROSS_DEPTH,
-                        );
-                        if let Some(crosses) = crosses {
-                            let crosses = match filter_crosses_reduce_only(
-                                crosses,
-                                market_index,
-                                &user_cache,
-                                &perp_market,
-                                oracle_price,
-                            ) {
-                                Some(crosses) => crosses,
-                                None => continue,
-                            };
-                            let allow_bid = limiter.allow_event(slot, crosses.best_bid.order_id);
-                            let allow_ask = limiter.allow_event(slot, crosses.best_ask.order_id);
-                            if allow_bid || allow_ask {
-                                log::info!(target: TARGET, "found onchain crosses. market: {},{crosses:?}", market.index());
-                                try_onchain_cross(
-                                    drift,
-                                    priority_fee,
-                                    config.fill_cu_limit,
-                                    market_index,
-                                    filler_subaccount,
-                                    crosses,
-                                    &user_cache,
-                                    tx_worker_ref.clone(),
-                                    pyth_update,
-                                    trigger_price,
-                                ).await;
-                            }
-                        }
-
-                        if slot % 300 == 0 {
-                            use_median_trigger_price = drift
+                    if slot % 300 == 0 {
+                        use_median_trigger_price = drift
                             .state_account()
                             .map(|s| s.feature_bit_flags & 0b0000_0010 != 0) // FeatureBitFlags::MedianTriggerPrice 功能位
                             .unwrap_or(false);
-                        }
                     }
-                    let duration = std::time::SystemTime::now().duration_since(t0).unwrap().as_millis();
-                    log::trace!(target: TARGET, "⏱️ checked fills at {slot}: {:?}ms", duration);
+                }
+                book_update = book_rx.recv() => {
+                    if book_update.is_some() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        if now_ms.saturating_sub(last_book_event_ms) < EVENT_WINDOW_MS {
+                            continue;
+                        }
+                        last_book_event_ms = now_ms;
+
+                        let t0 = std::time::SystemTime::now();
+                        let unix_now = t0
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64;
+                        let priority_fee =
+                            scale_priority_fee(priority_fee_subscriber.priority_fee_nth(0.5));
+
+                        for market in &market_ids {
+                            let market_index = market.index();
+                            let perp_market = match drift.try_get_perp_market_account(market_index) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let chain_oracle_data =
+                                match drift.try_get_mmoracle_for_perp_market(market_index, slot) {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                            let mut oracle_price = chain_oracle_data.price as u64;
+                            let trigger_price = perp_market
+                                .get_trigger_price(
+                                    oracle_price as i64,
+                                    unix_now,
+                                    use_median_trigger_price,
+                                )
+                                .unwrap_or(oracle_price);
+                            let mut pyth_update = None;
+                            if let Some(p) = pyth_oracle_prices.get(&market_index) {
+                                if oracle_price != p.price {
+                                    oracle_price = p.price;
+                                    pyth_update = Some(p.clone());
+                                }
+                            }
+
+                            let crosses = dlob.find_crossing_region_all_types(
+                                oracle_price,
+                                market_index,
+                                MarketType::Perp,
+                                Some(&perp_market),
+                                trigger_price,
+                                CROSS_DEPTH,
+                            );
+                            if let Some(crosses) = crosses {
+                                let crosses = match filter_crosses_reduce_only(
+                                    crosses,
+                                    market_index,
+                                    &user_cache,
+                                    &perp_market,
+                                    oracle_price,
+                                ) {
+                                    Some(crosses) => crosses,
+                                    None => continue,
+                                };
+                                let allow_bid = limiter.allow_event(slot, crosses.best_bid.order_id);
+                                let allow_ask = limiter.allow_event(slot, crosses.best_ask.order_id);
+                                if allow_bid || allow_ask {
+                                    log::info!(target: TARGET, "event onchain cross. market: {},{crosses:?}", market.index());
+                                    try_onchain_cross(
+                                        drift,
+                                        priority_fee,
+                                        config.fill_cu_limit,
+                                        market_index,
+                                        filler_subaccount,
+                                        crosses,
+                                        &user_cache,
+                                        tx_worker_ref.clone(),
+                                        pyth_update,
+                                        trigger_price,
+                                    )
+                                    .await;
+                                }
+                            }
+
+                            if let Some(strategy) = jit_strategy.as_mut() {
+                                let intent_opt = if let Some((ref_price, ref_ts)) =
+                                    jit_price_cache.get(&market_index)
+                                {
+                                    let ref_price = *ref_price;
+                                    let ref_ts = *ref_ts;
+                                    strategy.maybe_intent(
+                                        market_index,
+                                        ref_price,
+                                        ref_ts,
+                                        now_ms,
+                                        dlob,
+                                        &perp_market,
+                                        oracle_price,
+                                        trigger_price,
+                                        &user_cache,
+                                    )
+                                } else {
+                                    None
+                                };
+
+                                if let Some(intent) = intent_opt {
+                                    log::info!(
+                                        target: TARGET,
+                                        "jit trigger: market={}, ref_px={}, edge_ppm={}, best_bid={}, best_ask={}, makers_bid={}, makers_ask={}",
+                                        market_index,
+                                        intent.reference_price,
+                                        intent.edge_ppm,
+                                        intent.best_bid_price,
+                                        intent.best_ask_price,
+                                        intent.makers_bid.len(),
+                                        intent.makers_ask.len(),
+                                    );
+                                    let pf = scale_priority_fee(priority_fee_subscriber.priority_fee_nth(0.5));
+                                    try_jit(
+                                        drift,
+                                        pf,
+                                        config.jit_cu_limit,
+                                        jit_subaccount,
+                                        &intent,
+                                        &user_cache,
+                                        tx_worker_ref.clone(),
+                                        jit_proxy_program_id,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        let duration = std::time::SystemTime::now()
+                            .duration_since(t0)
+                            .unwrap()
+                            .as_millis();
+                        log::trace!(target: TARGET, "⏱️ event check at {slot}: {:?}ms", duration);
+                    }
                 }
                 new_price = async {
                     match pyth_price_feed.as_mut() {
@@ -408,7 +537,16 @@ impl FillerBot {
                 }, if pyth_price_feed.is_some() => {
                     match new_price {
                         Some(update) => {
-                            pyth_oracle_prices.insert(update.market_id, update);
+                            let market_id = update.market_id;
+                            let price = update.price;
+                            pyth_oracle_prices.insert(market_id, update);
+                            if jit_strategy.is_some() && binance_feed.is_none() {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                jit_price_cache.insert(market_id, (price as i64, now_ms));
+                            }
                         }
                         None => {
                             log::warn!(target: TARGET, "pyth price feed disconnected; scheduling reconnect");
@@ -437,6 +575,95 @@ impl FillerBot {
                             log::warn!(target: TARGET, "pyth reconnect task failed: {err:?}");
                         }
                         None => {}
+                    }
+                }
+                binance_update = async {
+                    match binance_feed.as_mut() {
+                        Some(feed) => feed.recv().await,
+                        None => None,
+                    }
+                }, if binance_feed.is_some() => {
+                    match binance_update {
+                        Some(update) => {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            if now_ms.saturating_sub(last_binance_event_ms) < EVENT_WINDOW_MS {
+                                continue;
+                            }
+                            last_binance_event_ms = now_ms;
+
+                            jit_price_cache.insert(
+                                update.market_index,
+                                (update.binance_mid, update.ts_ms),
+                            );
+                            if let Some(strategy) = jit_strategy.as_mut() {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                let market_index = update.market_index;
+                                if let (Ok(perp_market), Ok(oracle_price_data)) = (
+                                    drift.try_get_perp_market_account(market_index),
+                                    drift.try_get_mmoracle_for_perp_market(market_index, slot),
+                                ) {
+                                    let oracle_price = oracle_price_data.price as u64;
+                                    let unix_now = std::time::SystemTime::now()
+                                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs() as i64;
+                                    let trigger_price = perp_market
+                                        .get_trigger_price(
+                                            oracle_price as i64,
+                                            unix_now,
+                                            use_median_trigger_price,
+                                        )
+                                        .unwrap_or(oracle_price);
+                                    if let Some(intent) = strategy.maybe_intent(
+                                        market_index,
+                                        update.binance_mid,
+                                        update.ts_ms,
+                                        now_ms,
+                                        dlob,
+                                        &perp_market,
+                                        oracle_price,
+                                        trigger_price,
+                                        &user_cache,
+                                    ) {
+                                        log::info!(
+                                            target: TARGET,
+                                            "jit trigger (binance): market={}, ref_px={}, edge_ppm={}, best_bid={}, best_ask={}, makers_bid={}, makers_ask={}",
+                                            market_index,
+                                            intent.reference_price,
+                                            intent.edge_ppm,
+                                            intent.best_bid_price,
+                                            intent.best_ask_price,
+                                            intent.makers_bid.len(),
+                                            intent.makers_ask.len(),
+                                        );
+                                        let pf = scale_priority_fee(
+                                            priority_fee_subscriber.priority_fee_nth(0.5),
+                                        );
+                                        try_jit(
+                                            drift,
+                                            pf,
+                                            config.jit_cu_limit,
+                                            jit_subaccount,
+                                            &intent,
+                                            &user_cache,
+                                            tx_worker_ref.clone(),
+                                            jit_proxy_program_id,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!(target: TARGET, "binance price feed disconnected");
+                            binance_feed = None;
+                        }
                     }
                 }
             }
@@ -515,7 +742,7 @@ fn collect_swift_crosses(
     crosses
 }
 
-fn is_invalid_reduce_only(
+pub(crate) fn is_invalid_reduce_only(
     order: &L3Order,
     market_index: u16,
     user_cache: &WsAccountCache,
@@ -638,6 +865,26 @@ fn filter_crosses_reduce_only(
     })
 }
 
+fn scale_priority_fee(fee: u64) -> u64 {
+    fee / 10
+}
+
+fn binance_symbol_from_name(name: &str) -> Option<String> {
+    let mut s = name.trim_matches('\0').to_ascii_uppercase();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = s.strip_suffix("-PERP") {
+        s = stripped.to_string();
+    } else if let Some(stripped) = s.strip_suffix("PERP") {
+        s = stripped.to_string();
+    }
+    if s.is_empty() {
+        return None;
+    }
+    Some(format!("{s}USDC"))
+}
+
 fn spawn_swift_reconnect(
     drift: &'static DriftClient,
     market_ids: Vec<MarketId>,
@@ -716,6 +963,7 @@ pub async fn setup_ws(
     market_ids: Vec<MarketId>,
 ) -> (
     tokio::sync::mpsc::Receiver<u64>,
+    tokio::sync::mpsc::Receiver<()>,
     WsAccountCache,
     WsSubscriptions,
 ) {
@@ -735,6 +983,7 @@ pub async fn setup_ws(
     }
 
     let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
+    let (book_tx, book_rx) = tokio::sync::mpsc::channel(1024);
 
     let ws_url = get_ws_url(drift.rpc().url().as_str()).expect("ws url");
     let commitment = CommitmentConfig::processed();
@@ -752,6 +1001,7 @@ pub async fn setup_ws(
     let user_unsub = user_subscriber.subscribe::<User, _>("filler-user", {
         let user_cache = user_cache.clone();
         let dlob_notifier = dlob_notifier.clone();
+        let book_tx = book_tx.clone();
         move |update| {
             let pubkey = match Pubkey::from_str(update.pubkey.as_str()) {
                 Ok(pubkey) => pubkey,
@@ -766,6 +1016,7 @@ pub async fn setup_ws(
                 update.data_and_slot.slot,
                 Some(&dlob_notifier),
             );
+            let _ = book_tx.try_send(());
         }
     });
 
@@ -796,6 +1047,7 @@ pub async fn setup_ws(
         let drift = drift.clone();
         let dlob_notifier = dlob_notifier.clone();
         let slot_tx = slot_tx.clone();
+        let book_tx = book_tx.clone();
         let market_ids = market_ids.clone();
         move |update| {
             let new_slot = update.latest_slot;
@@ -820,6 +1072,7 @@ pub async fn setup_ws(
             if slot_tx.try_send(new_slot).is_err() {
                 log::debug!(target: TARGET, "slot channel full; drop slot={new_slot}");
             }
+            let _ = book_tx.try_send(());
         }
     }) {
         log::warn!(target: TARGET, "slot ws subscribe failed: {err:?}");
@@ -827,6 +1080,7 @@ pub async fn setup_ws(
 
     (
         slot_rx,
+        book_rx,
         user_cache,
         WsSubscriptions {
             user_unsub,

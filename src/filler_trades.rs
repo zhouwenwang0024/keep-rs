@@ -84,7 +84,7 @@ pub(crate) async fn try_swift_fill(
         None
     };
 
-    let base_cu = cu_limit.saturating_mul(2);
+    let base_cu = cu_limit.saturating_mul(3);
     let mut tx_builder = TransactionBuilder::new(
         drift.program_data(),
         filler_subaccount,
@@ -160,7 +160,7 @@ pub(crate) async fn try_swift_fill(
         if ix.accounts.len() >= 30 {
             tx_builder = tx_builder.set_ix(
                 1,
-                ComputeBudgetInstruction::set_compute_unit_limit(base_cu * 2),
+                ComputeBudgetInstruction::set_compute_unit_limit(base_cu * 3),
             );
         }
     }
@@ -210,7 +210,7 @@ pub(crate) async fn try_onchain_cross(
         }
     };
 
-    let base_cu = cu_limit.saturating_mul(2);
+    let base_cu = cu_limit.saturating_mul(3);
     let mut tx_builder = TransactionBuilder::new(
         drift.program_data(),
         filler_subaccount,
@@ -306,7 +306,7 @@ pub(crate) async fn try_onchain_cross(
         if ix.accounts.len() >= 30 {
             tx_builder = tx_builder.set_ix(
                 1,
-                ComputeBudgetInstruction::set_compute_unit_limit(base_cu * 2),
+                ComputeBudgetInstruction::set_compute_unit_limit(base_cu * 3),
             );
         }
     }

@@ -103,6 +103,11 @@ pub enum TxIntent {
     SwiftFill {
         maker_crosses: MakerCrosses,
     },
+    Jit {
+        market_index: u16,
+        reference_price: i64,
+        edge_ppm: i64,
+    },
     OnchainCross {
         slot: u64,
         market_index: u16,
@@ -150,6 +155,7 @@ impl TxIntent {
                     "swift_fill"
                 }
             }
+            TxIntent::Jit { .. } => "jit",
             TxIntent::OnchainCross { .. } => "onchain_cross",
             TxIntent::LimitUncross { .. } => "limit_uncross",
             TxIntent::VAMMTakerFill { .. } => "vamm_taker",
@@ -167,6 +173,7 @@ impl TxIntent {
             TxIntent::SwiftFill { maker_crosses, .. } => {
                 maker_crosses.orders.len() + if maker_crosses.has_vamm_cross { 1 } else { 0 }
             }
+            TxIntent::Jit { .. } => 1,
             TxIntent::OnchainCross { .. } => 1,
             TxIntent::VAMMTakerFill { .. } => 1,
             TxIntent::LimitUncross { .. } => 1,
@@ -192,6 +199,7 @@ impl TxIntent {
             TxIntent::SwiftFill { maker_crosses, .. } => {
                 (maker_crosses.orders.to_vec(), maker_crosses.slot)
             }
+            TxIntent::Jit { .. } => (vec![], 0),
             TxIntent::OnchainCross { slot, .. } => (vec![], *slot),
             Self::VAMMTakerFill { slot, .. } => (vec![], *slot),
             Self::LimitUncross { slot, .. } => (vec![], *slot),

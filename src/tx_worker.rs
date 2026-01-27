@@ -7,7 +7,13 @@ use std::{
 use drift_rs::{
     event_subscriber::DriftEvent,
     types::{CommitmentConfig, RpcSendTransactionConfig, VersionedMessage},
-    DriftClient,
+    DriftClient, Wallet,
+};
+use solana_sdk::{
+    message::{Message, VersionedMessage as SolanaVersionedMessage},
+    hash::Hash,
+    system_instruction,
+    transaction::VersionedTransaction,
 };
 use solana_rpc_client_api::config::RpcTransactionConfig;
 use solana_sdk::{signature::Signature, transaction::TransactionError};
@@ -17,8 +23,26 @@ use tokio::{runtime::Handle, sync::RwLock};
 use crate::{
     filler::TARGET,
     http::Metrics,
+    jito_sender::JitoSender,
     util::{PendingTxMeta, PendingTxs, TxIntent},
 };
+
+struct JitoConfig {
+    sender: JitoSender,
+    tip_account: solana_sdk::pubkey::Pubkey,
+    tip_lamports: u64,
+}
+
+fn build_tip_tx(
+    wallet: &Wallet,
+    blockhash: Hash,
+    jito: &JitoConfig,
+) -> drift_rs::types::SdkResult<VersionedTransaction> {
+    let ix = system_instruction::transfer(wallet.authority(), &jito.tip_account, jito.tip_lamports);
+    let msg = Message::new(&[ix], Some(wallet.authority()));
+    let vmsg = SolanaVersionedMessage::Legacy(msg);
+    wallet.sign_tx(vmsg, blockhash)
+}
 
 pub(crate) enum TxWork {
     Send {
@@ -38,15 +62,36 @@ pub(crate) struct TxWorker {
     pending_txs: Arc<RwLock<PendingTxs<1024>>>,
     metrics: Arc<Metrics>,
     dry_run: bool,
+    jito: Option<Arc<JitoConfig>>,
 }
 
 impl TxWorker {
     pub fn new(drift: DriftClient, metrics: Arc<Metrics>, dry_run: bool) -> Self {
+        let jito_sender = JitoSender::from_env().map(|sender| {
+            let tip_account = std::env::var("JITO_TIP_ACCOUNT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe"
+                        .parse()
+                        .expect("default jito tip account")
+                });
+            let tip_lamports = std::env::var("JITO_TIP_LAMPORTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000);
+            JitoConfig {
+                sender,
+                tip_account,
+                tip_lamports,
+            }
+        });
         Self {
             drift: Box::leak(Box::new(drift)),
             pending_txs: Arc::new(RwLock::new(PendingTxs::new())),
             metrics,
             dry_run,
+            jito: jito_sender.map(Arc::new),
         }
     }
     pub fn run(self, rt: tokio::runtime::Handle) -> TxSender {
@@ -80,6 +125,7 @@ impl TxWorker {
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
+        let jito = self.jito.clone();
         let intent_label = intent.label();
         metrics.tx_sent.with_label_values(&[intent_label]).inc();
         metrics
@@ -91,18 +137,61 @@ impl TxWorker {
         }
 
         rt.spawn(async move {
-            match drift
-                .sign_and_send_with_config(
-                    tx,
-                    None,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        max_retries: Some(0),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
+            let blockhash = match drift.rpc().get_latest_blockhash().await {
+                Ok(v) => v,
+                Err(err) => {
+                    log::warn!(target: TARGET, "failed to get blockhash: {err:?}");
+                    metrics
+                        .tx_failed
+                        .with_label_values(&[intent_label, "blockhash_error"])
+                        .inc();
+                    return;
+                }
+            };
+
+            let rpc_fut = drift.sign_and_send_with_config(
+                tx.clone(),
+                Some(blockhash),
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(0),
+                    ..Default::default()
+                },
+            );
+
+            let jito_fut = async {
+                if let Some(jito) = jito {
+                    let business_tx = match drift.wallet().sign_tx(tx, blockhash) {
+                        Ok(tx) => tx,
+                        Err(err) => return Err(format!("sign business tx failed: {err:?}")),
+                    };
+                    let tip_tx = match build_tip_tx(drift.wallet(), blockhash, &jito) {
+                        Ok(tx) => tx,
+                        Err(err) => return Err(format!("sign tip tx failed: {err:?}")),
+                    };
+                    let raw_business = bincode::serialize(&business_tx)
+                        .map_err(|err| format!("encode business tx failed: {err:?}"))?;
+                    let raw_tip = bincode::serialize(&tip_tx)
+                        .map_err(|err| format!("encode tip tx failed: {err:?}"))?;
+                    jito.sender
+                        .send_bundle_base64(&[raw_tip, raw_business])
+                        .await
+                        .map_err(|err| format!("jito send failed: {err}"))?;
+                }
+                Ok::<(), String>(())
+            };
+
+            let (rpc_res, jito_res) = tokio::join!(rpc_fut, jito_fut);
+
+            if let Err(err) = jito_res {
+                log::warn!(target: TARGET, "jito send error: {err}");
+                metrics
+                    .tx_failed
+                    .with_label_values(&[intent_label, "jito_send_error"])
+                    .inc();
+            }
+
+            match rpc_res {
                 Ok(sig) => {
                     log::info!(
                         target: TARGET,
