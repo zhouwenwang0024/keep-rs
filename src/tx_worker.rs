@@ -28,6 +28,7 @@ struct JitoConfig {
 pub(crate) enum TxWork {
     Send {
         tx: VersionedMessage,
+        jito_tx: Option<VersionedMessage>,
         ts: u64,
         intent: TxIntent,
         cu_limit: u64,
@@ -65,6 +66,7 @@ impl TxWorker {
                 match work {
                     TxWork::Send {
                         tx,
+                        jito_tx,
                         ts: _,
                         intent,
                         cu_limit,
@@ -73,7 +75,7 @@ impl TxWorker {
                             log::debug!(target: TARGET, "skip tx dry run: {intent:?}");
                             continue;
                         }
-                        self.send_tx(&rt, tx, intent, cu_limit);
+                        self.send_tx(&rt, tx, jito_tx, intent, cu_limit);
                     }
                     TxWork::Confirm { tx, ts: _ } => {
                         self.confirm_tx(&rt, tx);
@@ -83,7 +85,14 @@ impl TxWorker {
         });
         TxSender(tx)
     }
-    fn send_tx(&self, rt: &Handle, tx: VersionedMessage, intent: TxIntent, cu_limit: u64) {
+    fn send_tx(
+        &self,
+        rt: &Handle,
+        tx: VersionedMessage,
+        jito_tx: Option<VersionedMessage>,
+        intent: TxIntent,
+        cu_limit: u64,
+    ) {
         log::debug!(target: TARGET, "txworker send tx: {intent:?}");
         let drift = self.drift;
         let pending_txs = Arc::clone(&self.pending_txs);
@@ -124,7 +133,8 @@ impl TxWorker {
 
             let jito_fut = async {
                 if let Some(jito) = jito {
-                    let business_tx = match drift.wallet().sign_tx(tx, blockhash) {
+                    let jito_msg = jito_tx.unwrap_or_else(|| tx.clone());
+                    let business_tx = match drift.wallet().sign_tx(jito_msg, blockhash) {
                         Ok(tx) => tx,
                         Err(err) => return Err(format!("sign business tx failed: {err:?}")),
                     };
@@ -362,6 +372,28 @@ impl TxSender {
         self.0
             .send(TxWork::Send {
                 tx,
+                jito_tx: None,
+                ts: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                intent,
+                cu_limit,
+            })
+            .expect("sent");
+    }
+
+    pub fn send_tx_with_jito(
+        &self,
+        tx: VersionedMessage,
+        jito_tx: Option<VersionedMessage>,
+        intent: TxIntent,
+        cu_limit: u64,
+    ) {
+        self.0
+            .send(TxWork::Send {
+                tx,
+                jito_tx,
                 ts: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()

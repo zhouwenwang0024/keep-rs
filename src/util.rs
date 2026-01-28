@@ -10,7 +10,7 @@ use drift_rs::{
     },
     dlob::{L3Order, MakerCrosses},
     types::{MarketId, MarketType},
-    Pubkey, TransactionBuilder,
+    Pubkey,
 };
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
@@ -23,7 +23,7 @@ use pyth_lazer_protocol::{
     },
     subscription::{SubscribeRequest, SubscriptionId},
 };
-use solana_sdk::{signature::Signature, system_instruction};
+use solana_sdk::{instruction::Instruction, signature::Signature, system_instruction};
 
 pub struct OrderSlotLimiter<const N: usize> {
     slots: [Vec<u32>; N],
@@ -49,12 +49,9 @@ fn jito_enabled() -> bool {
     false
 }
 
-pub fn maybe_add_jito_tip(
-    mut tx_builder: TransactionBuilder<'_>,
-    authority: Pubkey,
-) -> TransactionBuilder<'_> {
+pub fn jito_tip_ix(authority: Pubkey) -> Option<Instruction> {
     if !jito_enabled() {
-        return tx_builder;
+        return None;
     }
     let tip_account = std::env::var("JITO_TIP_ACCOUNT")
         .ok()
@@ -64,9 +61,11 @@ pub fn maybe_add_jito_tip(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_JITO_TIP_LAMPORTS);
-    let ix = system_instruction::transfer(&authority, &tip_account, tip_lamports);
-    tx_builder = tx_builder.add_ix(ix);
-    tx_builder
+    Some(system_instruction::transfer(
+        &authority,
+        &tip_account,
+        tip_lamports,
+    ))
 }
 
 impl<const N: usize> OrderSlotLimiter<N> {

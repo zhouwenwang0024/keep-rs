@@ -12,7 +12,7 @@ use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use crate::{
     filler::TARGET,
     tx_worker::TxSender,
-    util::{maybe_add_jito_tip, PythPriceUpdate, TxIntent},
+    util::{jito_tip_ix, PythPriceUpdate, TxIntent},
     ws_cache::WsAccountCache,
 };
 
@@ -177,10 +177,12 @@ pub(crate) async fn try_swift_fill(
         }
     }
 
-    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
-    let tx = tx_builder.build();
-    tx_worker_ref.send_tx(
-        tx,
+    let rpc_tx = tx_builder.build();
+    let jito_tx = jito_tip_ix(*drift.wallet().authority())
+        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+    tx_worker_ref.send_tx_with_jito(
+        rpc_tx,
+        jito_tx,
         TxIntent::SwiftFill {
             maker_crosses: crosses,
         },
@@ -336,10 +338,12 @@ pub(crate) async fn try_onchain_cross(
         }
     }
 
-    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
-    let tx = tx_builder.build();
-    tx_worker_ref.send_tx(
-        tx,
+    let rpc_tx = tx_builder.build();
+    let jito_tx = jito_tip_ix(*drift.wallet().authority())
+        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+    tx_worker_ref.send_tx_with_jito(
+        rpc_tx,
+        jito_tx,
         TxIntent::OnchainCross {
             slot: crosses.slot,
             market_index,

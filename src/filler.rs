@@ -214,8 +214,15 @@ impl FillerBot {
         } else {
             None
         };
+        log::info!(
+            target: TARGET,
+            "jit feed init: symbols={}, binance_enabled={}",
+            jit_symbols.len(),
+            binance_feed.is_some()
+        );
         let mut last_book_event_ms: u64 = 0;
         let mut last_binance_event_ms: u64 = 0;
+        let mut last_jit_check_ms: u64 = 0;
 
         loop {
             tokio::select! {
@@ -617,6 +624,16 @@ impl FillerBot {
                                     .unwrap()
                                     .as_millis() as u64;
                                 let market_index = update.market_index;
+                                if now_ms.saturating_sub(last_jit_check_ms) >= 60_000 {
+                                    last_jit_check_ms = now_ms;
+                                    log::info!(
+                                        target: TARGET,
+                                        "jit check: market={}, binance_mid={}, ts_ms={}",
+                                        market_index,
+                                        update.binance_mid,
+                                        update.ts_ms
+                                    );
+                                }
                                 if let (Ok(perp_market), Ok(oracle_price_data)) = (
                                     drift.try_get_perp_market_account(market_index),
                                     drift.try_get_mmoracle_for_perp_market(market_index, slot),

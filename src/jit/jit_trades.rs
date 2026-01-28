@@ -6,7 +6,7 @@ use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use crate::{
     jit::jit_strategy::JitIntent,
     tx_worker::TxSender,
-    util::{maybe_add_jito_tip, TxIntent as TxIntentKind},
+    util::{jito_tip_ix, TxIntent as TxIntentKind},
     ws_cache::WsAccountCache,
 };
 
@@ -95,7 +95,6 @@ pub(crate) async fn try_jit(
         }
     }
 
-    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
     log::info!(
         "jit send: market={}, ref_px={}, edge_ppm={}, makers_bid={}, makers_ask={}",
         intent.market_index,
@@ -104,9 +103,12 @@ pub(crate) async fn try_jit(
         intent.makers_bid.len(),
         intent.makers_ask.len(),
     );
-    let tx = tx_builder.build();
-    tx_worker_ref.send_tx(
-        tx,
+    let rpc_tx = tx_builder.build();
+    let jito_tx = jito_tip_ix(*drift.wallet().authority())
+        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+    tx_worker_ref.send_tx_with_jito(
+        rpc_tx,
+        jito_tx,
         TxIntentKind::Jit {
             market_index: intent.market_index,
             reference_price: intent.reference_price,
