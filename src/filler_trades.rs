@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use drift_rs::{
     dlob::{CrossingRegionAll, MakerCrosses, OrderKind},
-    types::{accounts::User, MarketType, OrderTriggerCondition},
+    types::{accounts::{User, UserStats}, MarketType, OrderTriggerCondition},
     DriftClient, Pubkey, TransactionBuilder, Wallet,
 };
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
@@ -12,7 +12,7 @@ use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use crate::{
     filler::TARGET,
     tx_worker::TxSender,
-    util::{PythPriceUpdate, TxIntent},
+    util::{maybe_add_jito_tip, PythPriceUpdate, TxIntent},
     ws_cache::WsAccountCache,
 };
 
@@ -77,6 +77,17 @@ pub(crate) async fn try_swift_fill(
         }
     }
     maker_accounts.push(taker_account_data);
+
+    let mut maker_stats_vec: Vec<UserStats> = Vec::new();
+    for maker in &maker_accounts {
+        let maker_stats_pubkey = Wallet::derive_stats_account(&maker.authority);
+        match user_cache.get_stats_or_fetch(drift, &maker_stats_pubkey).await {
+            Ok(stats) => maker_stats_vec.push(stats),
+            Err(err) => {
+                log::warn!(target: TARGET, "missing maker stats: {err:?}");
+            }
+        }
+    }
 
     let revenue_share_authority = if swift_order.has_builder() {
         Some(taker_account_data.authority)
@@ -153,6 +164,7 @@ pub(crate) async fn try_swift_fill(
             taker_order.market_index,
             &filler_stats,
             maker_accounts.as_slice(),
+            maker_stats_vec.as_slice(),
             revenue_share_authority,
         );
 
@@ -165,6 +177,7 @@ pub(crate) async fn try_swift_fill(
         }
     }
 
+    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
     let tx = tx_builder.build();
     tx_worker_ref.send_tx(
         tx,
@@ -295,10 +308,22 @@ pub(crate) async fn try_onchain_cross(
         }
     }
 
+    let mut maker_stats_vec: Vec<UserStats> = Vec::new();
+    for maker in &maker_accounts {
+        let maker_stats_pubkey = Wallet::derive_stats_account(&maker.authority);
+        match user_cache.get_stats_or_fetch(drift, &maker_stats_pubkey).await {
+            Ok(stats) => maker_stats_vec.push(stats),
+            Err(err) => {
+                log::warn!(target: TARGET, "missing maker stats: {err:?}");
+            }
+        }
+    }
+
     tx_builder = tx_builder.proxy_spread_capture(
         market_index,
         &filler_stats,
         maker_accounts.as_slice(),
+        maker_stats_vec.as_slice(),
         None,
     );
 
@@ -311,6 +336,7 @@ pub(crate) async fn try_onchain_cross(
         }
     }
 
+    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
     let tx = tx_builder.build();
     tx_worker_ref.send_tx(
         tx,

@@ -45,7 +45,7 @@ use crate::{
         DashboardState, DashboardStateRef, HighRiskUser, MarginStatus, Metrics, OraclePriceInfo,
         UserMarginStatus,
     },
-    util::{PythPriceUpdate, TxIntent},
+    util::{maybe_add_jito_tip, PythPriceUpdate, TxIntent},
     ws_cache::{sync_user_accounts_ws, WsAccountCache},
     Config, UseMarkets,
 };
@@ -1338,6 +1338,7 @@ fn try_liquidate_with_match(
         }
     }
 
+    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
     let tx = tx_builder.build();
 
     tx_sender.send_tx(
@@ -1817,7 +1818,7 @@ impl LiquidateWithMatchStrategy {
                 _ => unreachable!(),
             };
 
-            let tx = if use_titan {
+            let tx_builder = if use_titan {
                 TransactionBuilder::new(
                     drift.program_data(),
                     keeper_subaccount,
@@ -1835,7 +1836,6 @@ impl LiquidateWithMatchStrategy {
                     liability_market_index,
                     &liquidatee_account_data,
                 )
-                .build()
             } else {
                 TransactionBuilder::new(
                     drift.program_data(),
@@ -1854,8 +1854,8 @@ impl LiquidateWithMatchStrategy {
                     liability_market_index,
                     &liquidatee_account_data,
                 )
-                .build()
             };
+            let tx = maybe_add_jito_tip(tx_builder, *drift.wallet().authority()).build();
             // log::debug!(
             //     target: TARGET,
             //     "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",

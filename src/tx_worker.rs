@@ -7,13 +7,7 @@ use std::{
 use drift_rs::{
     event_subscriber::DriftEvent,
     types::{CommitmentConfig, RpcSendTransactionConfig, VersionedMessage},
-    DriftClient, Wallet,
-};
-use solana_sdk::{
-    message::{Message, VersionedMessage as SolanaVersionedMessage},
-    hash::Hash,
-    system_instruction,
-    transaction::VersionedTransaction,
+    DriftClient,
 };
 use solana_rpc_client_api::config::RpcTransactionConfig;
 use solana_sdk::{signature::Signature, transaction::TransactionError};
@@ -29,19 +23,6 @@ use crate::{
 
 struct JitoConfig {
     sender: JitoSender,
-    tip_account: solana_sdk::pubkey::Pubkey,
-    tip_lamports: u64,
-}
-
-fn build_tip_tx(
-    wallet: &Wallet,
-    blockhash: Hash,
-    jito: &JitoConfig,
-) -> drift_rs::types::SdkResult<VersionedTransaction> {
-    let ix = system_instruction::transfer(wallet.authority(), &jito.tip_account, jito.tip_lamports);
-    let msg = Message::new(&[ix], Some(wallet.authority()));
-    let vmsg = SolanaVersionedMessage::Legacy(msg);
-    wallet.sign_tx(vmsg, blockhash)
 }
 
 pub(crate) enum TxWork {
@@ -67,25 +48,7 @@ pub(crate) struct TxWorker {
 
 impl TxWorker {
     pub fn new(drift: DriftClient, metrics: Arc<Metrics>, dry_run: bool) -> Self {
-        let jito_sender = JitoSender::from_env().map(|sender| {
-            let tip_account = std::env::var("JITO_TIP_ACCOUNT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe"
-                        .parse()
-                        .expect("default jito tip account")
-                });
-            let tip_lamports = std::env::var("JITO_TIP_LAMPORTS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10_000);
-            JitoConfig {
-                sender,
-                tip_account,
-                tip_lamports,
-            }
-        });
+        let jito_sender = JitoSender::from_env().map(|sender| JitoConfig { sender });
         Self {
             drift: Box::leak(Box::new(drift)),
             pending_txs: Arc::new(RwLock::new(PendingTxs::new())),
@@ -165,16 +128,10 @@ impl TxWorker {
                         Ok(tx) => tx,
                         Err(err) => return Err(format!("sign business tx failed: {err:?}")),
                     };
-                    let tip_tx = match build_tip_tx(drift.wallet(), blockhash, &jito) {
-                        Ok(tx) => tx,
-                        Err(err) => return Err(format!("sign tip tx failed: {err:?}")),
-                    };
                     let raw_business = bincode::serialize(&business_tx)
                         .map_err(|err| format!("encode business tx failed: {err:?}"))?;
-                    let raw_tip = bincode::serialize(&tip_tx)
-                        .map_err(|err| format!("encode tip tx failed: {err:?}"))?;
                     jito.sender
-                        .send_bundle_base64(&[raw_tip, raw_business])
+                        .send_bundle_base64(&[raw_business])
                         .await
                         .map_err(|err| format!("jito send failed: {err}"))?;
                 }

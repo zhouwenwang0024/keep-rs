@@ -53,37 +53,37 @@ pub struct Config {
     pub mainnet: bool,
     #[clap(long, default_value = "512")]
     pub priority_fee: u64,
-    #[clap(long, default_value = "364000")]
+    #[clap(long, env = "SWIFT_CU_LIMIT", default_value = "364000")]
     pub swift_cu_limit: u32,
-    #[clap(long, default_value = "256000")]
+    #[clap(long, env = "FILL_CU_LIMIT", default_value = "256000")]
     pub fill_cu_limit: u32,
     #[clap(long, env = "DRY_RUN", default_value = "false")]
     pub dry: bool,
-    #[clap(long, default_value = "0")]
+    #[clap(long, env = "SUB_ACCOUNT_ID", default_value = "0")]
     pub sub_account_id: u16,
     /// Enable JIT strategy
-    #[clap(long, default_value = "true")]
+    #[clap(long, env = "JIT_ENABLED", default_value = "true")]
     pub jit_enabled: bool,
     /// JIT subaccount id
-    #[clap(long, default_value = "1")]
+    #[clap(long, env = "JIT_SUB_ACCOUNT_ID", default_value = "1")]
     pub jit_sub_account_id: u16,
     /// JIT edge threshold in ppm (1e6 = 100%)
-    #[clap(long, default_value = "5000")]
+    #[clap(long, env = "JIT_EDGE_PPM", default_value = "5000")]
     pub jit_edge_ppm: i64,
     /// Max makers per side for JIT
-    #[clap(long, default_value = "3")]
+    #[clap(long, env = "JIT_MAX_MAKERS_PER_SIDE", default_value = "3")]
     pub jit_max_makers_per_side: usize,
     /// JIT cooldown in milliseconds
-    #[clap(long, default_value = "5")]
+    #[clap(long, env = "JIT_COOLDOWN_MS", default_value = "5")]
     pub jit_cooldown_ms: u64,
     /// JIT price staleness limit in milliseconds
-    #[clap(long, default_value = "1500")]
+    #[clap(long, env = "JIT_PRICE_STALE_MS", default_value = "1500")]
     pub jit_price_stale_ms: u64,
     /// JIT compute unit limit
-    #[clap(long, default_value = "256000")]
+    #[clap(long, env = "JIT_CU_LIMIT", default_value = "256000")]
     pub jit_cu_limit: u32,
     /// Optional jit-proxy program id (defaults to Ecx5sm34...)
-    #[clap(long, default_value = "")]
+    #[clap(long, env = "JIT_PROXY_PROGRAM_ID", default_value = "")]
     pub jit_proxy_program_id: String,
     /// Optional fast check interval in ms (0 disables)
     #[clap(long, default_value = "0")]

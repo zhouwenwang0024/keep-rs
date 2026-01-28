@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
-use drift_rs::{types::accounts::User, DriftClient, Pubkey, TransactionBuilder, Wallet};
+use drift_rs::{types::accounts::{User, UserStats}, DriftClient, Pubkey, TransactionBuilder, Wallet};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 
 use crate::{
     jit::jit_strategy::JitIntent,
     tx_worker::TxSender,
-    util::TxIntent as TxIntentKind,
+    util::{maybe_add_jito_tip, TxIntent as TxIntentKind},
     ws_cache::WsAccountCache,
 };
 
@@ -55,6 +55,16 @@ pub(crate) async fn try_jit(
             }
         }
     }
+    let mut maker_stats_vec: Vec<UserStats> = Vec::new();
+    for maker in &maker_accounts {
+        let maker_stats_pubkey = Wallet::derive_stats_account(&maker.authority);
+        match user_cache.get_stats_or_fetch(drift, &maker_stats_pubkey).await {
+            Ok(stats) => maker_stats_vec.push(stats),
+            Err(err) => {
+                log::warn!("jit missing maker stats: {err:?}");
+            }
+        }
+    }
 
     let base_cu = cu_limit.saturating_mul(3);
     let mut tx_builder = TransactionBuilder::new(
@@ -72,6 +82,7 @@ pub(crate) async fn try_jit(
         intent.edge_ppm,
         &jit_stats,
         maker_accounts.as_slice(),
+        maker_stats_vec.as_slice(),
         proxy_program_id,
     );
 
@@ -84,6 +95,15 @@ pub(crate) async fn try_jit(
         }
     }
 
+    tx_builder = maybe_add_jito_tip(tx_builder, *drift.wallet().authority());
+    log::info!(
+        "jit send: market={}, ref_px={}, edge_ppm={}, makers_bid={}, makers_ask={}",
+        intent.market_index,
+        intent.reference_price,
+        intent.edge_ppm,
+        intent.makers_bid.len(),
+        intent.makers_ask.len(),
+    );
     let tx = tx_builder.build();
     tx_worker_ref.send_tx(
         tx,

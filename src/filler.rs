@@ -107,8 +107,7 @@ impl FillerBot {
             .filter_map(|m| {
                 let market = drift
                     .program_data()
-                    .perp_market_config_by_index(m.index())
-                    .ok()?;
+                    .perp_market_config_by_index(m.index())?;
                 let name = core::str::from_utf8(&market.name).ok()?;
                 let symbol = binance_symbol_from_name(name)?;
                 Some((m.index(), symbol))
@@ -546,6 +545,13 @@ impl FillerBot {
                                     .unwrap()
                                     .as_millis() as u64;
                                 jit_price_cache.insert(market_id, (price as i64, now_ms));
+                                log::debug!(
+                                    target: TARGET,
+                                    "jit price update (pyth): market={}, price={}, ts_ms={}",
+                                    market_id,
+                                    price as i64,
+                                    now_ms
+                                );
                             }
                         }
                         None => {
@@ -597,6 +603,13 @@ impl FillerBot {
                             jit_price_cache.insert(
                                 update.market_index,
                                 (update.binance_mid, update.ts_ms),
+                            );
+                            log::debug!(
+                                target: TARGET,
+                                "jit price update (binance): market={}, price={}, ts_ms={}",
+                                update.market_index,
+                                update.binance_mid,
+                                update.ts_ms
                             );
                             if let Some(strategy) = jit_strategy.as_mut() {
                                 let now_ms = std::time::SystemTime::now()

@@ -10,7 +10,7 @@ use drift_rs::{
     },
     dlob::{L3Order, MakerCrosses},
     types::{MarketId, MarketType},
-    Pubkey,
+    Pubkey, TransactionBuilder,
 };
 use futures_util::StreamExt;
 use pyth_lazer_client::AnyResponse;
@@ -23,11 +23,50 @@ use pyth_lazer_protocol::{
     },
     subscription::{SubscribeRequest, SubscriptionId},
 };
-use solana_sdk::signature::Signature;
+use solana_sdk::{signature::Signature, system_instruction};
 
 pub struct OrderSlotLimiter<const N: usize> {
     slots: [Vec<u32>; N],
     generations: [u64; N],
+}
+
+const DEFAULT_JITO_TIP_ACCOUNT: &str = "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe";
+const DEFAULT_JITO_TIP_LAMPORTS: u64 = 10_000;
+
+fn jito_enabled() -> bool {
+    if let Ok(list) = std::env::var("JITO_UUIDS") {
+        if list.split(',').any(|s| !s.trim().is_empty()) {
+            return true;
+        }
+    }
+    for key in ["JITO_UUID1", "JITO_UUID2", "JITO_UUID"] {
+        if let Ok(val) = std::env::var(key) {
+            if !val.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn maybe_add_jito_tip(
+    mut tx_builder: TransactionBuilder<'_>,
+    authority: Pubkey,
+) -> TransactionBuilder<'_> {
+    if !jito_enabled() {
+        return tx_builder;
+    }
+    let tip_account = std::env::var("JITO_TIP_ACCOUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| DEFAULT_JITO_TIP_ACCOUNT.parse().expect("valid tip account"));
+    let tip_lamports = std::env::var("JITO_TIP_LAMPORTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_JITO_TIP_LAMPORTS);
+    let ix = system_instruction::transfer(&authority, &tip_account, tip_lamports);
+    tx_builder = tx_builder.add_ix(ix);
+    tx_builder
 }
 
 impl<const N: usize> OrderSlotLimiter<N> {

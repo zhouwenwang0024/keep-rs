@@ -7,7 +7,6 @@ use drift_rs::{
 
 use crate::{jit::maker_select::best_levels_with_makers, ws_cache::WsAccountCache};
 
-const EDGE_PRECISION: i128 = 1_000_000;
 const BASIS_EMA_POINTS: i64 = 300;
 const BASIS_EMA_ALPHA: f64 = 2.0 / (BASIS_EMA_POINTS as f64 + 1.0);
 const BASIS_ALIGN_MAX_MS: u64 = 500;
@@ -60,21 +59,48 @@ impl JitStrategy {
         user_cache: &WsAccountCache,
     ) -> Option<JitIntent> {
         if binance_mid <= 0 {
+            log::trace!(
+                target: "filler",
+                "jit skip: invalid binance_mid market={}, binance_mid={}",
+                market_index,
+                binance_mid
+            );
             return None;
         }
         if now_ms.saturating_sub(reference_ts_ms) > self.staleness_ms {
+            log::debug!(
+                target: "filler",
+                "jit skip: stale ref price market={}, age_ms={}, staleness_ms={}",
+                market_index,
+                now_ms.saturating_sub(reference_ts_ms),
+                self.staleness_ms
+            );
             return None;
         }
         if now_ms.saturating_sub(reference_ts_ms) > BASIS_ALIGN_MAX_MS {
+            log::debug!(
+                target: "filler",
+                "jit skip: basis align too old market={}, age_ms={}, max_ms={}",
+                market_index,
+                now_ms.saturating_sub(reference_ts_ms),
+                BASIS_ALIGN_MAX_MS
+            );
             return None;
         }
         if let Some(last) = self.last_fire_ms.get(&market_index) {
             if now_ms.saturating_sub(*last) < self.cooldown_ms {
+                log::debug!(
+                    target: "filler",
+                    "jit skip: cooldown market={}, since_last_ms={}, cooldown_ms={}",
+                    market_index,
+                    now_ms.saturating_sub(*last),
+                    self.cooldown_ms
+                );
                 return None;
             }
         }
 
-        let (best_bid, best_ask) = best_levels_with_makers(
+        let (best_bid, best_ask) = match best_levels_with_makers(
             dlob,
             market_index,
             MarketType::Perp,
@@ -83,7 +109,17 @@ impl JitStrategy {
             trigger_price,
             self.max_makers_per_side,
             user_cache,
-        )?;
+        ) {
+            Some(levels) => levels,
+            None => {
+                log::debug!(
+                    target: "filler",
+                    "jit skip: no best levels market={}",
+                    market_index
+                );
+                return None;
+            }
+        };
 
         let drift_mid = (best_bid.price as i128 + best_ask.price as i128) / 2;
         let now_sec = now_ms / 1000;
@@ -98,24 +134,32 @@ impl JitStrategy {
         let basis = *self.basis_ema.get(&market_index).unwrap_or(&0.0);
         let reference_price = (binance_mid as f64 - 0.8 * basis).round() as i64;
         if reference_price <= 0 {
+            log::debug!(
+                target: "filler",
+                "jit skip: invalid reference_price market={}, ref_px={}",
+                market_index,
+                reference_price
+            );
             return None;
         }
 
-        let ref_i128 = reference_price as i128;
-        let edge_i128 = self.edge_ppm.abs() as i128;
-        let bid_threshold = ref_i128
-            .saturating_mul(EDGE_PRECISION.saturating_add(edge_i128))
-            / EDGE_PRECISION;
-        let ask_threshold = ref_i128
-            .saturating_mul(EDGE_PRECISION.saturating_sub(edge_i128))
-            / EDGE_PRECISION;
-
         let best_bid_i128 = best_bid.price as i128;
         let best_ask_i128 = best_ask.price as i128;
-        let sell_ok = best_bid_i128 >= bid_threshold;
-        let buy_ok = best_ask_i128 <= ask_threshold;
+        let ref_i128 = reference_price as i128;
+        let sell_ok = best_bid_i128 > ref_i128;
+        let buy_ok = best_ask_i128 < ref_i128;
 
         if !sell_ok && !buy_ok {
+            log::debug!(
+                target: "filler",
+                "jit no cross: market={}, ref_px={}, best_bid={}, best_ask={}, sell_ok={}, buy_ok={}",
+                market_index,
+                reference_price,
+                best_bid.price,
+                best_ask.price,
+                sell_ok,
+                buy_ok
+            );
             return None;
         }
 
