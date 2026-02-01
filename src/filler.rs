@@ -1,5 +1,16 @@
 //! 补单机器人
-use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    io,
+    path::Path,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use drift_rs::{
     dlob::{CrossingRegionAll, L3Order, MakerCrosses, DLOB},
@@ -19,13 +30,22 @@ use drift_rs::{
     DriftClient, Pubkey,
 };
 use drift_rs::types::MarketPrecision;
+use dashmap::DashMap;
+use flate2::Compression;
 use futures_util::StreamExt;
 use solana_account_decoder_client_types::UiAccountEncoding;
 
 use crate::{
     filler_trades::{try_onchain_cross, try_swift_fill},
     http::Metrics,
-    jit::{feed_binance::spawn_binance_price_feed, jit_trades::try_jit, JitStrategy},
+    jit::{
+        feed_binance::spawn_binance_price_feed,
+        feed_dlob_ws::spawn_dlob_l2_feed,
+        jit_trades::try_jit,
+        DriftL2Update,
+        JitMarketState,
+        JitStrategy,
+    },
     tx_worker::{TxSender, TxWorker},
     util::{OrderSlotLimiter, PythPriceUpdate},
     ws_cache::{sync_stats_accounts_ws, sync_user_accounts_ws, WsAccountCache},
@@ -36,10 +56,102 @@ pub(crate) const TARGET: &str = "filler";
 const CROSS_DEPTH: usize = 3;
 const EVENT_WINDOW_MS: u64 = 5;
 
+fn summarize_order_kinds(orders: &[L3Order]) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for order in orders {
+        let key = format!("{:?}", order.kind);
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    format!("{counts:?}")
+}
+
+fn pubkey_to_u32(key: &Pubkey) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.to_bytes().hash(&mut hasher);
+    (hasher.finish() & 0xFFFF_FFFF) as u32
+}
+
+fn collect_jit_users(makers_bid: &[L3Order], makers_ask: &[L3Order]) -> Vec<Pubkey> {
+    let mut users = HashSet::new();
+    for order in makers_bid.iter().chain(makers_ask.iter()) {
+        users.insert(order.user);
+    }
+    users.into_iter().collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct MidSnapshot {
+    binance_mid: i64,
+    binance_ts_ms: u64,
+    official_mid: i64,
+    official_ts_ms: u64,
+    dlob_mid: i64,
+    dlob_ts_ms: u64,
+    basis_ema: f64,
+}
+
+const MID_LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+
+fn rotate_and_compress_log(path: &str) -> io::Result<()> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Ok(());
+    }
+    let meta = fs::metadata(p)?;
+    if meta.len() < MID_LOG_ROTATE_BYTES {
+        return Ok(());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let rotated = format!("{path}.{ts}");
+    fs::rename(p, &rotated)?;
+    let gz_path = format!("{rotated}.gz");
+    let mut input = fs::File::open(&rotated)?;
+    let output = fs::File::create(&gz_path)?;
+    let mut encoder = flate2::write::GzEncoder::new(output, Compression::default());
+    io::copy(&mut input, &mut encoder)?;
+    let _ = encoder.finish()?;
+    let _ = fs::remove_file(&rotated);
+    Ok(())
+}
+
 struct WsSubscriptions {
     user_unsub: UnsubHandle,
     stats_unsub: UnsubHandle,
     slot_subscriber: SlotSubscriber,
+}
+
+enum DlobUpdate {
+    User {
+        pubkey: Pubkey,
+        prev_user: Option<User>,
+        user: User,
+        slot: u64,
+    },
+    SlotOracle {
+        market: MarketId,
+        slot: u64,
+        oracle_price: u64,
+    },
+}
+
+struct BusyGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl BusyGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 pub struct FillerBot {
@@ -48,6 +160,7 @@ pub struct FillerBot {
     filler_subaccount: Pubkey,
     jit_subaccount: Pubkey,
     jit_symbols: Vec<(u16, String)>,
+    jit_dlob_markets: Vec<(u16, String)>,
     slot_rx: tokio::sync::mpsc::Receiver<u64>,
     book_rx: tokio::sync::mpsc::Receiver<()>,
     swift_order_stream: SwiftOrderStream,
@@ -58,13 +171,20 @@ pub struct FillerBot {
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     pyth_price_feed: tokio::sync::mpsc::Receiver<PythPriceUpdate>,
     user_cache: WsAccountCache,
+    dlob_backlog: Arc<AtomicUsize>,
+    last_dlob_update_ms: Arc<AtomicU64>,
     _ws_subscriptions: WsSubscriptions,
 }
 
 impl FillerBot {
     pub async fn new(config: Config, drift: DriftClient, metrics: Arc<Metrics>) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-        let tx_worker = TxWorker::new(drift.clone(), metrics, config.dry);
+        let tx_worker = TxWorker::new(
+            drift.clone(),
+            metrics,
+            config.dry,
+            config.rpc_skip_preflight,
+        );
         let rt = tokio::runtime::Handle::current();
         let tx_worker_ref = tx_worker.run(rt);
 
@@ -113,6 +233,17 @@ impl FillerBot {
                 Some((m.index(), symbol))
             })
             .collect();
+        let jit_dlob_markets = market_ids
+            .iter()
+            .filter_map(|m| {
+                let market = drift
+                    .program_data()
+                    .perp_market_config_by_index(m.index())?;
+                let name = core::str::from_utf8(&market.name).ok()?;
+                let dlob_market = dlob_market_from_name(name)?;
+                Some((m.index(), dlob_market))
+            })
+            .collect();
 
         log::info!(target: TARGET, "subscribing swift orders");
         let swift_order_stream = drift
@@ -122,7 +253,7 @@ impl FillerBot {
         log::info!(target: TARGET, "subscribed swift orders");
 
         drift.subscribe_blockhashes().await.expect("subscribed");
-        let (slot_rx, book_rx, user_cache, ws_subscriptions) =
+        let (slot_rx, book_rx, user_cache, ws_subscriptions, dlob_backlog, last_dlob_update_ms) =
             setup_ws(drift.clone(), dlob, market_ids.clone()).await;
         log::info!(target: TARGET, "subscribed ws");
         if let Err(err) = user_cache
@@ -151,6 +282,7 @@ impl FillerBot {
             filler_subaccount,
             jit_subaccount,
             jit_symbols,
+            jit_dlob_markets,
             slot_rx,
             book_rx,
             swift_order_stream,
@@ -161,6 +293,8 @@ impl FillerBot {
             priority_fee_subscriber,
             pyth_price_feed,
             user_cache,
+            dlob_backlog,
+            last_dlob_update_ms,
             _ws_subscriptions: ws_subscriptions,
         }
     }
@@ -170,13 +304,16 @@ impl FillerBot {
         let mut swift_reconnect_task: Option<tokio::task::JoinHandle<SwiftOrderStream>> = None;
         let mut slot_rx = self.slot_rx;
         let mut book_rx = self.book_rx;
-        let mut limiter = self.limiter;
+        let onchain_limiter = Arc::new(tokio::sync::Mutex::new(self.limiter));
+        let mut jit_limiters =
+            BTreeMap::<u16, Arc<tokio::sync::Mutex<OrderSlotLimiter<40>>>>::new();
         let drift: &'static DriftClient = Box::leak(Box::new(self.drift));
         let dlob = self.dlob;
         let market_ids = self.market_ids;
         let filler_subaccount = self.filler_subaccount;
         let jit_subaccount = self.jit_subaccount;
         let jit_symbols = self.jit_symbols;
+        let jit_dlob_markets = self.jit_dlob_markets;
         let config = self.config.clone();
         let tx_worker_ref = self.tx_worker_ref.clone();
         let priority_fee_subscriber = Arc::clone(&self.priority_fee_subscriber);
@@ -191,13 +328,39 @@ impl FillerBot {
             tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<PythPriceUpdate>>,
         > = None;
         let mut pyth_oracle_prices = BTreeMap::<u16, PythPriceUpdate>::new();
-        let mut jit_strategy = Some(JitStrategy::new(
+        let start_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let jit_strategy = Arc::new(JitStrategy::new(
             config.jit_edge_ppm,
             config.jit_cooldown_ms,
             config.jit_price_stale_ms,
             config.jit_max_makers_per_side,
+            start_time_ms,
+            config.jit_warmup_ms,
         ));
         let mut jit_price_cache = BTreeMap::<u16, (i64, u64)>::new();
+        let mut jit_states = BTreeMap::<u16, Arc<tokio::sync::Mutex<JitMarketState>>>::new();
+        let mut arb_busy = BTreeMap::<u16, Arc<AtomicBool>>::new();
+        let mut jit_busy = BTreeMap::<u16, Arc<AtomicBool>>::new();
+        let mut arb_skip_counts = BTreeMap::<u16, u64>::new();
+        let mut jit_skip_counts = BTreeMap::<u16, u64>::new();
+        for market in &market_ids {
+            let market_index = market.index();
+            jit_states.insert(
+                market_index,
+                Arc::new(tokio::sync::Mutex::new(JitMarketState::default())),
+            );
+            jit_limiters.insert(
+                market_index,
+                Arc::new(tokio::sync::Mutex::new(OrderSlotLimiter::new())),
+            );
+            arb_busy.insert(market_index, Arc::new(AtomicBool::new(false)));
+            jit_busy.insert(market_index, Arc::new(AtomicBool::new(false)));
+            arb_skip_counts.insert(market_index, 0);
+            jit_skip_counts.insert(market_index, 0);
+        }
         let jit_proxy_program_id = if config.jit_proxy_program_id.trim().is_empty() {
             None
         } else {
@@ -209,6 +372,11 @@ impl FillerBot {
                 }
             }
         };
+        let jit_symbols_len = jit_symbols.len();
+        let jit_symbols_log = jit_symbols
+            .iter()
+            .map(|(mi, s)| (*mi, s.clone()))
+            .collect::<Vec<_>>();
         let mut binance_feed = if !jit_symbols.is_empty() {
             Some(spawn_binance_price_feed(jit_symbols))
         } else {
@@ -217,12 +385,92 @@ impl FillerBot {
         log::info!(
             target: TARGET,
             "jit feed init: symbols={}, binance_enabled={}",
-            jit_symbols.len(),
+            jit_symbols_len,
             binance_feed.is_some()
         );
+        log::info!(
+            target: TARGET,
+            "jit symbols: {:?}",
+            jit_symbols_log
+        );
+        log::info!(
+            target: TARGET,
+            "jit official l2 feed: enabled={}, url={}",
+            !config.dlob_l2_ws_url.trim().is_empty(),
+            config.dlob_l2_ws_url
+        );
+        let mut official_l2_feed = if !config.dlob_l2_ws_url.trim().is_empty()
+            && !jit_dlob_markets.is_empty()
+        {
+            Some(spawn_dlob_l2_feed(
+                jit_dlob_markets.clone(),
+                config.dlob_l2_ws_url.clone(),
+            ))
+        } else {
+            None
+        };
+        let mut official_l2_cache = BTreeMap::<u16, (i64, u64)>::new();
+        let mid_snapshots = Arc::new(DashMap::<u16, MidSnapshot>::new());
+        let mid_log_path = config.jit_mid_log_path.trim().to_string();
+        if !mid_log_path.is_empty() {
+            let market_ids = market_ids.clone();
+            let mid_snapshots = Arc::clone(&mid_snapshots);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap();
+                    let ts_secs = now.as_secs();
+                    let mut lines = String::new();
+                    for market in market_ids.iter() {
+                        let market_index = market.index();
+                        let snap = mid_snapshots
+                            .get(&market_index)
+                            .map(|s| s.clone())
+                            .unwrap_or_default();
+                        lines.push_str(&format!(
+                            "{} m={} b={} o={} d={} e={:.6}\n",
+                            ts_secs,
+                            market_index,
+                            snap.binance_mid,
+                            snap.official_mid,
+                            snap.dlob_mid,
+                            snap.basis_ema
+                        ));
+                    }
+                    if lines.is_empty() {
+                        continue;
+                    }
+                    let path = mid_log_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = rotate_and_compress_log(&path);
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let _ = std::io::Write::write_all(&mut file, lines.as_bytes());
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
         let mut last_book_event_ms: u64 = 0;
-        let mut last_binance_event_ms: u64 = 0;
+        let mut last_binance_event_ms = BTreeMap::<u16, u64>::new();
         let mut last_jit_check_ms: u64 = 0;
+        let mut jit_idle_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut diag_tick = tokio::time::interval(Duration::from_secs(5));
+        let dlob_backlog = Arc::clone(&self.dlob_backlog);
+        let last_dlob_update_ms = Arc::clone(&self.last_dlob_update_ms);
+        for market in &market_ids {
+            last_binance_event_ms.insert(market.index(), 0);
+        }
+        let mut official_l2_reconnect_task: Option<
+            tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<DriftL2Update>>,
+        > = None;
 
         loop {
             tokio::select! {
@@ -366,6 +614,45 @@ impl FillerBot {
                         }
                     }
                 }
+                _ = jit_idle_tick.tick() => {
+                    if binance_feed.is_some() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        let last_update_ms = last_binance_event_ms
+                            .values()
+                            .copied()
+                            .max()
+                            .unwrap_or(0);
+                        if last_update_ms == 0 || now_ms.saturating_sub(last_update_ms) >= 60_000 {
+                            log::warn!(
+                                target: TARGET,
+                                "jit binance idle: last_update_ms={}, now_ms={}",
+                                last_update_ms,
+                                now_ms
+                            );
+                        }
+                    }
+                }
+                _ = diag_tick.tick() => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let backlog = dlob_backlog.load(Ordering::Relaxed);
+                    let dlob_age_ms = now_ms.saturating_sub(last_dlob_update_ms.load(Ordering::Relaxed));
+                    let skipped_arb: u64 = arb_skip_counts.values().copied().sum();
+                    let skipped_jit: u64 = jit_skip_counts.values().copied().sum();
+                    log::info!(
+                        target: TARGET,
+                        "diag: dlob_backlog={}, dlob_age_ms={}, arb_skips={}, jit_skips={}",
+                        backlog,
+                        dlob_age_ms,
+                        skipped_arb,
+                        skipped_jit
+                    );
+                }
                 swift_reconnect = async {
                     if let Some(task) = swift_reconnect_task.as_mut() {
                         Some(task.await)
@@ -413,120 +700,131 @@ impl FillerBot {
                             .as_secs() as i64;
                         let priority_fee =
                             scale_priority_fee(priority_fee_subscriber.priority_fee_nth(0.5));
+                        let pyth_snapshot = Arc::new(pyth_oracle_prices.clone());
 
                         for market in &market_ids {
                             let market_index = market.index();
-                            let perp_market = match drift.try_get_perp_market_account(market_index) {
-                                Ok(m) => m,
-                                Err(_) => continue,
+                            let busy_flag = match arb_busy.get(&market_index) {
+                                Some(flag) => Arc::clone(flag),
+                                None => continue,
                             };
-                            let chain_oracle_data =
-                                match drift.try_get_mmoracle_for_perp_market(market_index, slot) {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
-                                };
-                            let mut oracle_price = chain_oracle_data.price as u64;
-                            let trigger_price = perp_market
-                                .get_trigger_price(
-                                    oracle_price as i64,
-                                    unix_now,
-                                    use_median_trigger_price,
-                                )
-                                .unwrap_or(oracle_price);
-                            let mut pyth_update = None;
-                            if let Some(p) = pyth_oracle_prices.get(&market_index) {
-                                if oracle_price != p.price {
-                                    oracle_price = p.price;
-                                    pyth_update = Some(p.clone());
+                            if busy_flag.swap(true, Ordering::AcqRel) {
+                                if let Some(count) = arb_skip_counts.get_mut(&market_index) {
+                                    *count += 1;
                                 }
-                            }
-
-                            let crosses = dlob.find_crossing_region_all_types(
-                                oracle_price,
-                                market_index,
-                                MarketType::Perp,
-                                Some(&perp_market),
-                                trigger_price,
-                                CROSS_DEPTH,
-                            );
-                            if let Some(crosses) = crosses {
-                                let crosses = match filter_crosses_reduce_only(
-                                    crosses,
+                                log::debug!(
+                                    target: TARGET,
+                                    "arb skip: busy market={}, slot={}",
                                     market_index,
-                                    &user_cache,
-                                    &perp_market,
-                                    oracle_price,
-                                ) {
-                                    Some(crosses) => crosses,
-                                    None => continue,
-                                };
-                                let allow_bid = limiter.allow_event(slot, crosses.best_bid.order_id);
-                                let allow_ask = limiter.allow_event(slot, crosses.best_ask.order_id);
-                                if allow_bid || allow_ask {
-                                    log::info!(target: TARGET, "event onchain cross. market: {},{crosses:?}", market.index());
-                                    try_onchain_cross(
-                                        drift,
-                                        priority_fee,
-                                        config.fill_cu_limit,
-                                        market_index,
-                                        filler_subaccount,
-                                        crosses,
-                                        &user_cache,
-                                        tx_worker_ref.clone(),
-                                        pyth_update,
-                                        trigger_price,
-                                    )
-                                    .await;
-                                }
+                                    slot
+                                );
+                                continue;
                             }
 
-                            if let Some(strategy) = jit_strategy.as_mut() {
-                                let intent_opt = if let Some((ref_price, ref_ts)) =
-                                    jit_price_cache.get(&market_index)
+                            let drift = drift;
+                            let dlob = dlob;
+                            let user_cache = user_cache.clone();
+                            let tx_worker_ref = tx_worker_ref.clone();
+                            let onchain_limiter = Arc::clone(&onchain_limiter);
+                            let pyth_snapshot = Arc::clone(&pyth_snapshot);
+                            let busy_guard = BusyGuard::new(busy_flag);
+                            let config = config.clone();
+                            let filler_subaccount = filler_subaccount;
+                            let use_median_trigger_price = use_median_trigger_price;
+                            let slot = slot;
+                            let priority_fee = priority_fee;
+                            let unix_now = unix_now;
+
+                            tokio::spawn(async move {
+                                let _guard = busy_guard;
+                                let task_start = Instant::now();
+                                let perp_market =
+                                    match drift.try_get_perp_market_account(market_index) {
+                                        Ok(m) => m,
+                                        Err(_) => return,
+                                    };
+                                let chain_oracle_data = match drift
+                                    .try_get_mmoracle_for_perp_market(market_index, slot)
                                 {
-                                    let ref_price = *ref_price;
-                                    let ref_ts = *ref_ts;
-                                    strategy.maybe_intent(
+                                    Ok(v) => v,
+                                    Err(_) => return,
+                                };
+                                let mut oracle_price = chain_oracle_data.price as u64;
+                                let trigger_price = perp_market
+                                    .get_trigger_price(
+                                        oracle_price as i64,
+                                        unix_now,
+                                        use_median_trigger_price,
+                                    )
+                                    .unwrap_or(oracle_price);
+                                let mut pyth_update = None;
+                                if let Some(p) = pyth_snapshot.get(&market_index) {
+                                    if oracle_price != p.price {
+                                        oracle_price = p.price;
+                                        pyth_update = Some(p.clone());
+                                    }
+                                }
+
+                                let crosses = dlob.find_crossing_region_all_types(
+                                    oracle_price,
+                                    market_index,
+                                    MarketType::Perp,
+                                    Some(&perp_market),
+                                    trigger_price,
+                                    CROSS_DEPTH,
+                                );
+                                if let Some(crosses) = crosses {
+                                    let crosses = match filter_crosses_reduce_only(
+                                        crosses,
                                         market_index,
-                                        ref_price,
-                                        ref_ts,
-                                        now_ms,
-                                        dlob,
+                                        &user_cache,
                                         &perp_market,
                                         oracle_price,
-                                        trigger_price,
-                                        &user_cache,
-                                    )
-                                } else {
-                                    None
-                                };
-
-                                if let Some(intent) = intent_opt {
-                                    log::info!(
-                                        target: TARGET,
-                                        "jit trigger: market={}, ref_px={}, edge_ppm={}, best_bid={}, best_ask={}, makers_bid={}, makers_ask={}",
-                                        market_index,
-                                        intent.reference_price,
-                                        intent.edge_ppm,
-                                        intent.best_bid_price,
-                                        intent.best_ask_price,
-                                        intent.makers_bid.len(),
-                                        intent.makers_ask.len(),
-                                    );
-                                    let pf = scale_priority_fee(priority_fee_subscriber.priority_fee_nth(0.5));
-                                    try_jit(
-                                        drift,
-                                        pf,
-                                        config.jit_cu_limit,
-                                        jit_subaccount,
-                                        &intent,
-                                        &user_cache,
-                                        tx_worker_ref.clone(),
-                                        jit_proxy_program_id,
-                                    )
-                                    .await;
+                                    ) {
+                                        Some(crosses) => crosses,
+                                        None => return,
+                                    };
+                                    let (allow_bid, allow_ask) = {
+                                        let mut limiter = onchain_limiter.lock().await;
+                                        (
+                                            limiter.allow_event(slot, crosses.best_bid.order_id),
+                                            limiter.allow_event(slot, crosses.best_ask.order_id),
+                                        )
+                                    };
+                                    if allow_bid || allow_ask {
+                                        log::info!(
+                                            target: TARGET,
+                                            "event onchain cross. market: {},{crosses:?}",
+                                            market_index
+                                        );
+                                        try_onchain_cross(
+                                            drift,
+                                            priority_fee,
+                                            config.fill_cu_limit,
+                                            market_index,
+                                            filler_subaccount,
+                                            crosses,
+                                            &user_cache,
+                                            tx_worker_ref.clone(),
+                                            pyth_update,
+                                            trigger_price,
+                                        )
+                                        .await;
+                                    }
                                 }
-                            }
+
+                            // jit 只由 binance 更新触发，这里不再触发
+
+                                let elapsed_ms = task_start.elapsed().as_millis() as u64;
+                                if elapsed_ms > 50 {
+                                    log::warn!(
+                                        target: TARGET,
+                                        "market task slow: market={}, elapsed_ms={}",
+                                        market_index,
+                                        elapsed_ms
+                                    );
+                                }
+                            });
                         }
                         let duration = std::time::SystemTime::now()
                             .duration_since(t0)
@@ -544,22 +842,8 @@ impl FillerBot {
                     match new_price {
                         Some(update) => {
                             let market_id = update.market_id;
-                            let price = update.price;
                             pyth_oracle_prices.insert(market_id, update);
-                            if jit_strategy.is_some() && binance_feed.is_none() {
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis() as u64;
-                                jit_price_cache.insert(market_id, (price as i64, now_ms));
-                                log::debug!(
-                                    target: TARGET,
-                                    "jit price update (pyth): market={}, price={}, ts_ms={}",
-                                    market_id,
-                                    price as i64,
-                                    now_ms
-                                );
-                            }
+                            // jit 仅由 binance 更新触发，pyth 更新不再触发 jit
                         }
                         None => {
                             log::warn!(target: TARGET, "pyth price feed disconnected; scheduling reconnect");
@@ -590,6 +874,56 @@ impl FillerBot {
                         None => {}
                     }
                 }
+                official_l2_update = async {
+                    match official_l2_feed.as_mut() {
+                        Some(feed) => feed.recv().await,
+                        None => None,
+                    }
+                }, if official_l2_feed.is_some() => {
+                    match official_l2_update {
+                        Some(update) => {
+                            official_l2_cache.insert(update.market_index, (update.mid, update.ts_ms));
+                            let mut snap = mid_snapshots.entry(update.market_index).or_default();
+                            snap.official_mid = update.mid;
+                            snap.official_ts_ms = update.ts_ms;
+                        }
+                        None => {
+                            log::warn!(target: TARGET, "jit official l2 feed ended");
+                            official_l2_feed = None;
+                            if official_l2_reconnect_task.is_none()
+                                && !config.dlob_l2_ws_url.trim().is_empty()
+                                && !jit_dlob_markets.is_empty()
+                            {
+                                let url = config.dlob_l2_ws_url.clone();
+                                let markets = jit_dlob_markets.clone();
+                                official_l2_reconnect_task = Some(tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    spawn_dlob_l2_feed(markets, url)
+                                }));
+                            }
+                        }
+                    }
+                }
+                official_l2_reconnect = async {
+                    if let Some(task) = official_l2_reconnect_task.as_mut() {
+                        Some(task.await)
+                    } else {
+                        None
+                    }
+                }, if official_l2_reconnect_task.is_some() => {
+                    match official_l2_reconnect {
+                        Some(Ok(feed)) => {
+                            official_l2_feed = Some(feed);
+                            official_l2_reconnect_task = None;
+                            log::info!(target: TARGET, "jit official l2 feed reconnected");
+                        }
+                        Some(Err(err)) => {
+                            official_l2_reconnect_task = None;
+                            log::warn!(target: TARGET, "jit official l2 reconnect failed: {err:?}");
+                        }
+                        None => {}
+                    }
+                }
                 binance_update = async {
                     match binance_feed.as_mut() {
                         Some(feed) => feed.recv().await,
@@ -602,15 +936,21 @@ impl FillerBot {
                                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis() as u64;
-                            if now_ms.saturating_sub(last_binance_event_ms) < EVENT_WINDOW_MS {
+                            let last_ms = *last_binance_event_ms.get(&update.market_index).unwrap_or(&0);
+                            if now_ms.saturating_sub(last_ms) < EVENT_WINDOW_MS {
                                 continue;
                             }
-                            last_binance_event_ms = now_ms;
+                            last_binance_event_ms.insert(update.market_index, now_ms);
 
                             jit_price_cache.insert(
                                 update.market_index,
                                 (update.binance_mid, update.ts_ms),
                             );
+                            {
+                                let mut snap = mid_snapshots.entry(update.market_index).or_default();
+                                snap.binance_mid = update.binance_mid;
+                                snap.binance_ts_ms = update.ts_ms;
+                            }
                             log::debug!(
                                 target: TARGET,
                                 "jit price update (binance): market={}, price={}, ts_ms={}",
@@ -618,22 +958,79 @@ impl FillerBot {
                                 update.binance_mid,
                                 update.ts_ms
                             );
-                            if let Some(strategy) = jit_strategy.as_mut() {
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis() as u64;
-                                let market_index = update.market_index;
-                                if now_ms.saturating_sub(last_jit_check_ms) >= 60_000 {
-                                    last_jit_check_ms = now_ms;
-                                    log::info!(
-                                        target: TARGET,
-                                        "jit check: market={}, binance_mid={}, ts_ms={}",
-                                        market_index,
-                                        update.binance_mid,
-                                        update.ts_ms
-                                    );
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            let market_index = update.market_index;
+                            if now_ms.saturating_sub(last_jit_check_ms) >= 60_000 {
+                                last_jit_check_ms = now_ms;
+                                log::info!(
+                                    target: TARGET,
+                                    "jit check: market={}, binance_mid={}, ts_ms={}",
+                                    market_index,
+                                    update.binance_mid,
+                                    update.ts_ms
+                                );
+                            }
+
+                            if let Some(jit_state) = jit_states.get(&market_index).map(Arc::clone) {
+                                if let Some((mid, ts_ms)) = official_l2_cache.get(&market_index).copied() {
+                                    if now_ms.saturating_sub(ts_ms) <= config.dlob_l2_stale_ms
+                                        && update.ts_ms.abs_diff(ts_ms) <= 1000
+                                    {
+                                        let mut state = jit_state.lock().await;
+                                        jit_strategy.update_basis_ema(
+                                            &mut *state,
+                                            update.binance_mid,
+                                            mid,
+                                            now_ms,
+                                        );
+                                        let mut snap = mid_snapshots.entry(market_index).or_default();
+                                        snap.basis_ema = state.basis_ema;
+                                    }
                                 }
+                            }
+
+                            let busy_flag = match jit_busy.get(&market_index) {
+                                Some(flag) => Arc::clone(flag),
+                                None => continue,
+                            };
+                            if busy_flag.swap(true, Ordering::AcqRel) {
+                                if let Some(count) = jit_skip_counts.get_mut(&market_index) {
+                                    *count += 1;
+                                }
+                                log::debug!(
+                                    target: TARGET,
+                                    "jit skip: busy market={}, slot={}",
+                                    market_index,
+                                    slot
+                                );
+                                continue;
+                            }
+
+                            let drift = drift;
+                            let dlob = dlob;
+                            let user_cache = user_cache.clone();
+                            let tx_worker_ref = tx_worker_ref.clone();
+                            let jit_limiter = jit_limiters.get(&market_index).map(Arc::clone);
+                            let jit_state = jit_states.get(&market_index).map(Arc::clone);
+                            let jit_strategy = Arc::clone(&jit_strategy);
+                            let priority_fee_subscriber = Arc::clone(&priority_fee_subscriber);
+                            let busy_guard = BusyGuard::new(busy_flag);
+                            let config = config.clone();
+                            let jit_proxy_program_id = jit_proxy_program_id;
+                            let jit_subaccount = jit_subaccount;
+                            let use_median_trigger_price = use_median_trigger_price;
+                            let slot = slot;
+                            let dlob_update_ms = last_dlob_update_ms.load(Ordering::Relaxed);
+                            let binance_mid = update.binance_mid;
+                            let binance_ts = update.ts_ms;
+                            let official_mid = official_l2_cache.get(&market_index).copied();
+                            let mid_snapshots = Arc::clone(&mid_snapshots);
+
+                            tokio::spawn(async move {
+                                let _guard = busy_guard;
                                 if let (Ok(perp_market), Ok(oracle_price_data)) = (
                                     drift.try_get_perp_market_account(market_index),
                                     drift.try_get_mmoracle_for_perp_market(market_index, slot),
@@ -650,45 +1047,112 @@ impl FillerBot {
                                             use_median_trigger_price,
                                         )
                                         .unwrap_or(oracle_price);
-                                    if let Some(intent) = strategy.maybe_intent(
-                                        market_index,
-                                        update.binance_mid,
-                                        update.ts_ms,
-                                        now_ms,
-                                        dlob,
-                                        &perp_market,
-                                        oracle_price,
-                                        trigger_price,
-                                        &user_cache,
-                                    ) {
-                                        log::info!(
-                                            target: TARGET,
-                                            "jit trigger (binance): market={}, ref_px={}, edge_ppm={}, best_bid={}, best_ask={}, makers_bid={}, makers_ask={}",
+                                    if let (Some(jit_limiter), Some(jit_state)) =
+                                        (jit_limiter, jit_state)
+                                    {
+                                        let mut state = jit_state.lock().await;
+                                        let prev_dlob_ts = state.last_dlob_ts_ms;
+                                        let intent_opt = jit_strategy.maybe_intent(
+                                            &mut *state,
                                             market_index,
-                                            intent.reference_price,
-                                            intent.edge_ppm,
-                                            intent.best_bid_price,
-                                            intent.best_ask_price,
-                                            intent.makers_bid.len(),
-                                            intent.makers_ask.len(),
-                                        );
-                                        let pf = scale_priority_fee(
-                                            priority_fee_subscriber.priority_fee_nth(0.5),
-                                        );
-                                        try_jit(
-                                            drift,
-                                            pf,
-                                            config.jit_cu_limit,
-                                            jit_subaccount,
-                                            &intent,
+                                            binance_mid,
+                                            binance_ts,
+                                            now_ms,
+                                            dlob,
+                                            &perp_market,
+                                            oracle_price,
+                                            trigger_price,
                                             &user_cache,
-                                            tx_worker_ref.clone(),
-                                            jit_proxy_program_id,
-                                        )
-                                        .await;
+                                            dlob_update_ms,
+                                            official_mid,
+                                            config.dlob_l2_stale_ms,
+                                        );
+                                        if state.last_dlob_ts_ms != prev_dlob_ts {
+                                            let mut snap = mid_snapshots.entry(market_index).or_default();
+                                            snap.dlob_mid = state.last_dlob_mid;
+                                            snap.dlob_ts_ms = state.last_dlob_ts_ms;
+                                        }
+                                        {
+                                            let mut snap = mid_snapshots.entry(market_index).or_default();
+                                            snap.basis_ema = state.basis_ema;
+                                        }
+                                        drop(state);
+
+                                        if let Some(intent) = intent_opt {
+                                            let (official_mid, official_age_ms) = match official_mid {
+                                                Some((mid, ts_ms)) => {
+                                                    (mid, now_ms.saturating_sub(ts_ms))
+                                                }
+                                                None => (0, u64::MAX),
+                                            };
+                                            let users = collect_jit_users(
+                                                &intent.makers_bid,
+                                                &intent.makers_ask,
+                                            );
+                                            let mut limiter = jit_limiter.lock().await;
+                                            let blocked = users
+                                                .iter()
+                                                .filter(|user| {
+                                                    !limiter.would_allow(slot, pubkey_to_u32(user))
+                                                })
+                                                .count();
+                                            if blocked > 0 {
+                                                log::debug!(
+                                                    target: TARGET,
+                                                    "jit skip: rate limited market={}, slot={}, blocked_users={}",
+                                                    market_index,
+                                                    slot,
+                                                    blocked
+                                                );
+                                                return;
+                                            }
+                                            for user in &users {
+                                                limiter.allow_event(slot, pubkey_to_u32(user));
+                                            }
+                                            let makers_bid_kinds =
+                                                summarize_order_kinds(&intent.makers_bid);
+                                            let makers_ask_kinds =
+                                                summarize_order_kinds(&intent.makers_ask);
+                                            log::info!(
+                                                target: TARGET,
+                                                "jit trigger (binance): market={}, ref_px={}, edge_ppm={}, best_bid={}, best_ask={}, drift_mid={}, official_mid={}, official_age_ms={}, binance_mid={}, basis_ema={:.4}, spread={:.4}, oracle_px={}, trigger_px={}, dlob_slot={}, makers_bid={}, makers_ask={}, makers_bid_kinds={}, makers_ask_kinds={}",
+                                                market_index,
+                                                intent.reference_price,
+                                                intent.edge_ppm,
+                                                intent.best_bid_price,
+                                                intent.best_ask_price,
+                                                intent.drift_mid,
+                                                official_mid,
+                                                official_age_ms,
+                                                intent.binance_mid,
+                                                intent.basis_ema,
+                                                intent.spread,
+                                                intent.oracle_price,
+                                                intent.trigger_price,
+                                                intent.dlob_slot,
+                                                intent.makers_bid.len(),
+                                                intent.makers_ask.len(),
+                                                makers_bid_kinds,
+                                                makers_ask_kinds,
+                                            );
+                                            let pf = scale_priority_fee(
+                                                priority_fee_subscriber.priority_fee_nth(0.5),
+                                            );
+                                            try_jit(
+                                                drift,
+                                                pf,
+                                                config.jit_cu_limit,
+                                                jit_subaccount,
+                                                &intent,
+                                                &user_cache,
+                                                tx_worker_ref.clone(),
+                                                jit_proxy_program_id,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
-                            }
+                            });
                         }
                         None => {
                             log::warn!(target: TARGET, "binance price feed disconnected");
@@ -896,23 +1360,34 @@ fn filter_crosses_reduce_only(
 }
 
 fn scale_priority_fee(fee: u64) -> u64 {
-    fee / 10
+    fee.saturating_mul(10)
 }
 
 fn binance_symbol_from_name(name: &str) -> Option<String> {
-    let mut s = name.trim_matches('\0').to_ascii_uppercase();
+    let mut s = name.trim_matches('\0').trim().to_ascii_uppercase();
     if s.is_empty() {
         return None;
     }
     if let Some(stripped) = s.strip_suffix("-PERP") {
-        s = stripped.to_string();
+        s = stripped.trim().to_string();
     } else if let Some(stripped) = s.strip_suffix("PERP") {
-        s = stripped.to_string();
+        s = stripped.trim().to_string();
     }
     if s.is_empty() {
         return None;
     }
     Some(format!("{s}USDC"))
+}
+
+fn dlob_market_from_name(name: &str) -> Option<String> {
+    let mut s = name.trim_matches('\0').trim().to_ascii_uppercase();
+    if s.is_empty() {
+        return None;
+    }
+    if !s.contains("-") {
+        s = format!("{s}-PERP");
+    }
+    Some(s)
 }
 
 fn spawn_swift_reconnect(
@@ -996,6 +1471,8 @@ pub async fn setup_ws(
     tokio::sync::mpsc::Receiver<()>,
     WsAccountCache,
     WsSubscriptions,
+    Arc<AtomicUsize>,
+    Arc<AtomicU64>,
 ) {
     let dlob_notifier = dlob.spawn_notifier();
     let user_cache = WsAccountCache::new();
@@ -1014,6 +1491,60 @@ pub async fn setup_ws(
 
     let (slot_tx, slot_rx) = tokio::sync::mpsc::channel(64);
     let (book_tx, book_rx) = tokio::sync::mpsc::channel(1024);
+    let (dlob_tx, mut dlob_rx) = tokio::sync::mpsc::unbounded_channel::<DlobUpdate>();
+    let dlob_backlog = Arc::new(AtomicUsize::new(0));
+    let last_dlob_update_ms = Arc::new(AtomicU64::new(0));
+
+    {
+        let dlob_notifier = dlob_notifier.clone();
+        let dlob_backlog = Arc::clone(&dlob_backlog);
+        let last_dlob_update_ms = Arc::clone(&last_dlob_update_ms);
+        tokio::spawn(async move {
+            while let Some(update) = dlob_rx.recv().await {
+                let t0 = Instant::now();
+                let kind = match &update {
+                    DlobUpdate::User { .. } => "user",
+                    DlobUpdate::SlotOracle { .. } => "slot_oracle",
+                };
+                match update {
+                    DlobUpdate::User {
+                        pubkey,
+                        prev_user,
+                        user,
+                        slot,
+                    } => {
+                        match prev_user.as_ref() {
+                            Some(prev) => dlob_notifier.user_update(pubkey, Some(prev), &user, slot),
+                            None => dlob_notifier.user_update(pubkey, None, &user, slot),
+                        }
+                    }
+                    DlobUpdate::SlotOracle {
+                        market,
+                        slot,
+                        oracle_price,
+                    } => {
+                        dlob_notifier.slot_and_oracle_update(market, slot, oracle_price);
+                    }
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                last_dlob_update_ms.store(now_ms, Ordering::Relaxed);
+                dlob_backlog.fetch_sub(1, Ordering::Relaxed);
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                if elapsed_ms > 25 {
+                    log::warn!(
+                        target: TARGET,
+                        "dlob update slow: kind={}, elapsed_ms={}",
+                        kind,
+                        elapsed_ms
+                    );
+                }
+            }
+            log::warn!(target: TARGET, "dlob update task ended");
+        });
+    }
 
     let ws_url = get_ws_url(drift.rpc().url().as_str()).expect("ws url");
     let commitment = CommitmentConfig::processed();
@@ -1030,7 +1561,8 @@ pub async fn setup_ws(
     );
     let user_unsub = user_subscriber.subscribe::<User, _>("filler-user", {
         let user_cache = user_cache.clone();
-        let dlob_notifier = dlob_notifier.clone();
+        let dlob_tx = dlob_tx.clone();
+        let dlob_backlog = Arc::clone(&dlob_backlog);
         let book_tx = book_tx.clone();
         move |update| {
             let pubkey = match Pubkey::from_str(update.pubkey.as_str()) {
@@ -1040,12 +1572,25 @@ pub async fn setup_ws(
                     return;
                 }
             };
-            user_cache.apply_user_update(
+            if let Some(prev_user) = user_cache.apply_user_update_and_get_prev(
                 pubkey,
                 update.data_and_slot.data,
                 update.data_and_slot.slot,
-                Some(&dlob_notifier),
-            );
+            ) {
+                dlob_backlog.fetch_add(1, Ordering::Relaxed);
+                if dlob_tx
+                    .send(DlobUpdate::User {
+                        pubkey,
+                        prev_user,
+                        user: update.data_and_slot.data,
+                        slot: update.data_and_slot.slot,
+                    })
+                    .is_err()
+                {
+                    dlob_backlog.fetch_sub(1, Ordering::Relaxed);
+                    log::error!(target: TARGET, "dlob update channel closed");
+                }
+            }
             let _ = book_tx.try_send(());
         }
     });
@@ -1075,7 +1620,8 @@ pub async fn setup_ws(
     let mut slot_subscriber = SlotSubscriber::new(drift.ws());
     if let Err(err) = slot_subscriber.subscribe({
         let drift = drift.clone();
-        let dlob_notifier = dlob_notifier.clone();
+        let dlob_tx = dlob_tx.clone();
+        let dlob_backlog = Arc::clone(&dlob_backlog);
         let slot_tx = slot_tx.clone();
         let book_tx = book_tx.clone();
         let market_ids = market_ids.clone();
@@ -1084,11 +1630,18 @@ pub async fn setup_ws(
             for market in market_ids.iter() {
                 match drift.try_get_mmoracle_for_perp_market(market.index(), new_slot) {
                     Ok(oracle_price_data) => {
-                        dlob_notifier.slot_and_oracle_update(
-                            *market,
-                            new_slot,
-                            oracle_price_data.price as u64,
-                        );
+                        dlob_backlog.fetch_add(1, Ordering::Relaxed);
+                        if dlob_tx
+                            .send(DlobUpdate::SlotOracle {
+                                market: *market,
+                                slot: new_slot,
+                                oracle_price: oracle_price_data.price as u64,
+                            })
+                            .is_err()
+                        {
+                            dlob_backlog.fetch_sub(1, Ordering::Relaxed);
+                            log::error!(target: TARGET, "dlob update channel closed");
+                        }
                     }
                     Err(err) => {
                         log::debug!(
@@ -1117,5 +1670,7 @@ pub async fn setup_ws(
             stats_unsub,
             slot_subscriber,
         },
+        dlob_backlog,
+        last_dlob_update_ms,
     )
 }

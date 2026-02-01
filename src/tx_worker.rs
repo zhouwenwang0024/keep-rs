@@ -44,17 +44,24 @@ pub(crate) struct TxWorker {
     pending_txs: Arc<RwLock<PendingTxs<1024>>>,
     metrics: Arc<Metrics>,
     dry_run: bool,
+    rpc_skip_preflight: bool,
     jito: Option<Arc<JitoConfig>>,
 }
 
 impl TxWorker {
-    pub fn new(drift: DriftClient, metrics: Arc<Metrics>, dry_run: bool) -> Self {
+    pub fn new(
+        drift: DriftClient,
+        metrics: Arc<Metrics>,
+        dry_run: bool,
+        rpc_skip_preflight: bool,
+    ) -> Self {
         let jito_sender = JitoSender::from_env().map(|sender| JitoConfig { sender });
         Self {
             drift: Box::leak(Box::new(drift)),
             pending_txs: Arc::new(RwLock::new(PendingTxs::new())),
             metrics,
             dry_run,
+            rpc_skip_preflight,
             jito: jito_sender.map(Arc::new),
         }
     }
@@ -98,6 +105,7 @@ impl TxWorker {
         let pending_txs = Arc::clone(&self.pending_txs);
         let metrics = self.metrics.clone();
         let jito = self.jito.clone();
+        let rpc_skip_preflight = self.rpc_skip_preflight;
         let intent_label = intent.label();
         metrics.tx_sent.with_label_values(&[intent_label]).inc();
         metrics
@@ -109,7 +117,7 @@ impl TxWorker {
         }
 
         rt.spawn(async move {
-            let blockhash = match drift.rpc().get_latest_blockhash().await {
+            let blockhash = match drift.get_latest_blockhash().await {
                 Ok(v) => v,
                 Err(err) => {
                     log::warn!(target: TARGET, "failed to get blockhash: {err:?}");
@@ -125,7 +133,7 @@ impl TxWorker {
                 tx.clone(),
                 Some(blockhash),
                 RpcSendTransactionConfig {
-                    skip_preflight: true,
+                    skip_preflight: rpc_skip_preflight,
                     max_retries: Some(0),
                     ..Default::default()
                 },

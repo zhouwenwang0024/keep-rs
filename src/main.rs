@@ -59,6 +59,9 @@ pub struct Config {
     pub fill_cu_limit: u32,
     #[clap(long, env = "DRY_RUN", default_value = "false")]
     pub dry: bool,
+    /// RPC send config: skip preflight simulation
+    #[clap(long, env = "RPC_SKIP_PREFLIGHT", default_value = "false")]
+    pub rpc_skip_preflight: bool,
     #[clap(long, env = "SUB_ACCOUNT_ID", default_value = "0")]
     pub sub_account_id: u16,
     /// Enable JIT strategy
@@ -79,12 +82,24 @@ pub struct Config {
     /// JIT price staleness limit in milliseconds
     #[clap(long, env = "JIT_PRICE_STALE_MS", default_value = "1500")]
     pub jit_price_stale_ms: u64,
+    /// JIT warmup window in milliseconds (skip signals during warmup)
+    #[clap(long, env = "JIT_WARMUP_MS", default_value = "300000")]
+    pub jit_warmup_ms: u64,
     /// JIT compute unit limit
     #[clap(long, env = "JIT_CU_LIMIT", default_value = "256000")]
     pub jit_cu_limit: u32,
     /// Optional jit-proxy program id (defaults to Ecx5sm34...)
     #[clap(long, env = "JIT_PROXY_PROGRAM_ID", default_value = "")]
     pub jit_proxy_program_id: String,
+    /// Optional DLOB WS URL for official L2 mid (empty disables)
+    #[clap(long, env = "DLOB_L2_WS_URL", default_value = "wss://dlob.drift.trade/ws")]
+    pub dlob_l2_ws_url: String,
+    /// Official L2 staleness limit in ms
+    #[clap(long, env = "DLOB_L2_STALE_MS", default_value = "1000")]
+    pub dlob_l2_stale_ms: u64,
+    /// Optional path to log mids once per second (empty disables)
+    #[clap(long, env = "JIT_MID_LOG_PATH", default_value = "")]
+    pub jit_mid_log_path: String,
     /// Optional fast check interval in ms (0 disables)
     #[clap(long, default_value = "0")]
     pub fast_check_ms: u64,

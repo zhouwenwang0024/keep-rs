@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use drift_rs::{
     dlob::{L3Order, DLOB},
-    types::{accounts::PerpMarket, MarketType, PositionDirection},
+    types::{accounts::PerpMarket, MarketType},
 };
 
 use crate::{filler::is_invalid_reduce_only, ws_cache::WsAccountCache};
@@ -22,33 +22,8 @@ pub fn best_levels_with_makers(
     trigger_price: u64,
     max_makers: usize,
     user_cache: &WsAccountCache,
-) -> Option<(BestLevel, BestLevel)> {
+) -> Option<(BestLevel, BestLevel, u64)> {
     let book = dlob.get_l3_snapshot(market_index, market_type);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let effective_price = |order: &L3Order, is_bid: bool| -> u64 {
-        if let Some(price) = order.post_trigger_price(book.slot, oracle_price, perp_market) {
-            return price;
-        }
-        if order.price == 0 {
-            let dir = if is_bid {
-                PositionDirection::Long
-            } else {
-                PositionDirection::Short
-            };
-            if let Ok(vamm_price) = perp_market.fallback_price(
-                dir,
-                oracle_price as i64,
-                order.max_ts.saturating_sub(now) as i64,
-            ) {
-                return vamm_price;
-            }
-        }
-        order.price
-    };
 
     let mut best_bid_price: Option<u64> = None;
     let mut best_ask_price: Option<u64> = None;
@@ -57,38 +32,40 @@ pub fn best_levels_with_makers(
     let mut seen_bids = HashSet::new();
     let mut seen_asks = HashSet::new();
 
-    for bid in book.bids(Some(oracle_price), Some(perp_market), Some(trigger_price)) {
-        if is_invalid_reduce_only(bid, market_index, user_cache) {
+    for bid in book.bids_with_price(Some(oracle_price), Some(perp_market), Some(trigger_price)) {
+        let order = bid.order;
+        let price = bid.price;
+        if is_invalid_reduce_only(order, market_index, user_cache) {
             continue;
         }
-        let price = effective_price(bid, true);
         if best_bid_price.is_none() {
             best_bid_price = Some(price);
         }
         if Some(price) != best_bid_price {
             break;
         }
-        if bid_makers.len() < max_makers && seen_bids.insert(bid.user) {
-            bid_makers.push(bid.clone());
+        if bid_makers.len() < max_makers && seen_bids.insert(order.user) {
+            bid_makers.push(order.clone());
         }
         if bid_makers.len() >= max_makers {
             break;
         }
     }
 
-    for ask in book.asks(Some(oracle_price), Some(perp_market), Some(trigger_price)) {
-        if is_invalid_reduce_only(ask, market_index, user_cache) {
+    for ask in book.asks_with_price(Some(oracle_price), Some(perp_market), Some(trigger_price)) {
+        let order = ask.order;
+        let price = ask.price;
+        if is_invalid_reduce_only(order, market_index, user_cache) {
             continue;
         }
-        let price = effective_price(ask, false);
         if best_ask_price.is_none() {
             best_ask_price = Some(price);
         }
         if Some(price) != best_ask_price {
             break;
         }
-        if ask_makers.len() < max_makers && seen_asks.insert(ask.user) {
-            ask_makers.push(ask.clone());
+        if ask_makers.len() < max_makers && seen_asks.insert(order.user) {
+            ask_makers.push(order.clone());
         }
         if ask_makers.len() >= max_makers {
             break;
@@ -107,5 +84,6 @@ pub fn best_levels_with_makers(
             price: best_ask_price,
             makers: ask_makers,
         },
+        book.slot,
     ))
 }

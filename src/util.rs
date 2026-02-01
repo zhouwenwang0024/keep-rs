@@ -64,7 +64,7 @@ pub fn jito_tip_ix(authority: Pubkey) -> Option<Instruction> {
     Some(system_instruction::transfer(
         &authority,
         &tip_account,
-        tip_lamports,
+        tip_lamports.saturating_mul(10),
     ))
 }
 
@@ -126,6 +126,29 @@ impl<const N: usize> OrderSlotLimiter<N> {
         }
 
         return true;
+    }
+
+    pub fn would_allow(&self, g: u64, id: u32) -> bool {
+        let idx = (g % N as u64) as usize;
+        if self.generations[idx] == g {
+            if self.slots[idx].binary_search(&id).is_ok() {
+                return false;
+            }
+        }
+        let mut count = 0;
+        for i in 2..=4 {
+            let past_g = g.saturating_sub(i);
+            let past_idx = (past_g % N as u64) as usize;
+            if self.generations[past_idx] == past_g {
+                if self.slots[past_idx].binary_search(&id).is_ok() {
+                    count += 1;
+                    if count >= 1 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 }
 

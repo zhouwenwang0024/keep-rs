@@ -27,35 +27,32 @@ pub(crate) async fn try_swift_fill(
     user_cache: &WsAccountCache,
     tx_worker_ref: TxSender,
 ) {
+    fn bump_cu_limit(base: u32) -> u32 {
+        base.saturating_mul(12) / 10
+    }
     log::info!(target: TARGET, "try fill swift order: {}", swift_order.order_uuid_str());
     let taker_order = swift_order.order_params();
     let taker_subaccount = swift_order.taker_subaccount();
 
-    let filler_account_data = match user_cache
-        .get_user_or_fetch(drift, &filler_subaccount)
-        .await
-    {
-        Ok(user) => user,
-        Err(err) => {
-            log::warn!(target: TARGET, "missing filler account: {err:?}");
+    let filler_account_data = match user_cache.get_user(&filler_subaccount) {
+        Some(user) => user,
+        None => {
+            log::warn!(target: TARGET, "missing filler account in cache: {filler_subaccount}");
             return;
         }
     };
     let filler_stats_pubkey = Wallet::derive_stats_account(&filler_account_data.authority);
-    let filler_stats = match user_cache
-        .get_stats_or_fetch(drift, &filler_stats_pubkey)
-        .await
-    {
-        Ok(stats) => stats,
-        Err(err) => {
-            log::warn!(target: TARGET, "missing filler stats: {err:?}");
+    let filler_stats = match user_cache.get_stats(&filler_stats_pubkey) {
+        Some(stats) => stats,
+        None => {
+            log::warn!(target: TARGET, "missing filler stats in cache: {filler_stats_pubkey}");
             return;
         }
     };
-    let taker_account_data = match user_cache.get_user_or_fetch(drift, &taker_subaccount).await {
-        Ok(user) => user,
-        Err(err) => {
-            log::warn!(target: TARGET, "missing taker data: {err:?}");
+    let taker_account_data = match user_cache.get_user(&taker_subaccount) {
+        Some(user) => user,
+        None => {
+            log::warn!(target: TARGET, "missing taker data in cache: {taker_subaccount}");
             return;
         }
     };
@@ -69,11 +66,10 @@ pub(crate) async fn try_swift_fill(
         if !seen.insert(order.user) {
             continue;
         }
-        match user_cache.get_user_or_fetch(drift, &order.user).await {
-            Ok(user) => maker_accounts.push(user),
-            Err(err) => {
-                log::warn!(target: TARGET, "missing maker account: {err:?}");
-            }
+        if let Some(user) = user_cache.get_user(&order.user) {
+            maker_accounts.push(user);
+        } else {
+            log::warn!(target: TARGET, "missing maker account in cache: {}", order.user);
         }
     }
     maker_accounts.push(taker_account_data);
@@ -81,11 +77,10 @@ pub(crate) async fn try_swift_fill(
     let mut maker_stats_vec: Vec<UserStats> = Vec::new();
     for maker in &maker_accounts {
         let maker_stats_pubkey = Wallet::derive_stats_account(&maker.authority);
-        match user_cache.get_stats_or_fetch(drift, &maker_stats_pubkey).await {
-            Ok(stats) => maker_stats_vec.push(stats),
-            Err(err) => {
-                log::warn!(target: TARGET, "missing maker stats: {err:?}");
-            }
+        if let Some(stats) = user_cache.get_stats(&maker_stats_pubkey) {
+            maker_stats_vec.push(stats);
+        } else {
+            log::warn!(target: TARGET, "missing maker stats in cache: {maker_stats_pubkey}");
         }
     }
 
@@ -95,14 +90,13 @@ pub(crate) async fn try_swift_fill(
         None
     };
 
-    let base_cu = cu_limit.saturating_mul(3);
+    let base_cu: u32 = 600_000;
     let mut tx_builder = TransactionBuilder::new(
         drift.program_data(),
         filler_subaccount,
         std::borrow::Cow::Borrowed(&filler_account_data),
         false,
-    )
-    .with_priority_fee(priority_fee, Some(base_cu));
+    );
     tx_builder = tx_builder.update_amms(vec![taker_order.market_index]);
 
     let mut seen_triggers = HashSet::<(Pubkey, u32)>::new();
@@ -117,10 +111,10 @@ pub(crate) async fn try_swift_fill(
 
         let trigger_user = order.user;
         let trigger_order_id = order.order_id;
-        let taker_account_data = match user_cache.get_user_or_fetch(drift, &trigger_user).await {
-            Ok(user) => user,
-            Err(err) => {
-                log::warn!(target: TARGET, "missing trigger user: {err:?}");
+        let taker_account_data = match user_cache.get_user(&trigger_user) {
+            Some(user) => user,
+            None => {
+                log::warn!(target: TARGET, "missing trigger user in cache: {trigger_user}");
                 return;
             }
         };
@@ -168,18 +162,43 @@ pub(crate) async fn try_swift_fill(
             revenue_share_authority,
         );
 
-    if let Some(ix) = tx_builder.ixs().last() {
+    // Jito: no priority fee, only set CU limit + tip.
+    let mut jito_builder = TransactionBuilder::new(
+        drift.program_data(),
+        filler_subaccount,
+        std::borrow::Cow::Borrowed(&filler_account_data),
+        false,
+    )
+    .add_ix(ComputeBudgetInstruction::set_compute_unit_limit(base_cu))
+    .update_amms(vec![taker_order.market_index])
+    .place_swift_order(&swift_order, &taker_account_data)
+    .proxy_spread_capture(
+        taker_order.market_index,
+        &filler_stats,
+        maker_accounts.as_slice(),
+        maker_stats_vec.as_slice(),
+        revenue_share_authority,
+    );
+    if let Some(ix) = jito_builder.ixs().last() {
         if ix.accounts.len() >= 30 {
-            tx_builder = tx_builder.set_ix(
-                1,
-                ComputeBudgetInstruction::set_compute_unit_limit(base_cu * 3),
+            jito_builder = jito_builder.set_ix(
+                0,
+                ComputeBudgetInstruction::set_compute_unit_limit(bump_cu_limit(base_cu)),
             );
         }
     }
-
-    let rpc_tx = tx_builder.build();
     let jito_tx = jito_tip_ix(*drift.wallet().authority())
-        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+        .map(|ix| jito_builder.build_with_extra_ixs(&[ix]));
+    let mut rpc_builder = tx_builder.with_priority_fee(priority_fee, Some(base_cu));
+    if let Some(ix) = rpc_builder.ixs().last() {
+        if ix.accounts.len() >= 30 {
+            rpc_builder = rpc_builder.set_ix(
+                1,
+                ComputeBudgetInstruction::set_compute_unit_limit(bump_cu_limit(base_cu)),
+            );
+        }
+    }
+    let rpc_tx = rpc_builder.build();
     tx_worker_ref.send_tx_with_jito(
         rpc_tx,
         jito_tx,
@@ -202,37 +221,33 @@ pub(crate) async fn try_onchain_cross(
     oracle_update: Option<PythPriceUpdate>,
     trigger_price: u64,
 ) {
-    let filler_account_data = match user_cache
-        .get_user_or_fetch(drift, &filler_subaccount)
-        .await
-    {
-        Ok(user) => user,
-        Err(err) => {
-            log::warn!(target: TARGET, "missing filler account: {err:?}");
+    fn bump_cu_limit(base: u32) -> u32 {
+        base.saturating_mul(12) / 10
+    }
+    let filler_account_data = match user_cache.get_user(&filler_subaccount) {
+        Some(user) => user,
+        None => {
+            log::warn!(target: TARGET, "missing filler account in cache: {filler_subaccount}");
             return;
         }
     };
 
     let filler_stats_pubkey = Wallet::derive_stats_account(&filler_account_data.authority);
-    let filler_stats = match user_cache
-        .get_stats_or_fetch(drift, &filler_stats_pubkey)
-        .await
-    {
-        Ok(stats) => stats,
-        Err(err) => {
-            log::warn!(target: TARGET, "missing filler stats: {err:?}");
+    let filler_stats = match user_cache.get_stats(&filler_stats_pubkey) {
+        Some(stats) => stats,
+        None => {
+            log::warn!(target: TARGET, "missing filler stats in cache: {filler_stats_pubkey}");
             return;
         }
     };
 
-    let base_cu = cu_limit.saturating_mul(3);
+    let base_cu: u32 = 600_000;
     let mut tx_builder = TransactionBuilder::new(
         drift.program_data(),
         filler_subaccount,
         std::borrow::Cow::Borrowed(&filler_account_data),
         false,
-    )
-    .with_priority_fee(priority_fee, Some(base_cu));
+    );
 
     if let Some(ref update_msg) = oracle_update {
         tx_builder = tx_builder
@@ -250,11 +265,10 @@ pub(crate) async fn try_onchain_cross(
         .chain(crosses.crossing_asks.iter())
     {
         if seen.insert(order.user) {
-            match user_cache.get_user_or_fetch(drift, &order.user).await {
-                Ok(user) => maker_accounts.push(user),
-                Err(err) => {
-                    log::warn!(target: TARGET, "missing maker account: {err:?}");
-                }
+            if let Some(user) = user_cache.get_user(&order.user) {
+                maker_accounts.push(user);
+            } else {
+                log::warn!(target: TARGET, "missing maker account in cache: {}", order.user);
             }
         }
 
@@ -263,14 +277,13 @@ pub(crate) async fn try_onchain_cross(
             if seen_triggers.insert(key) {
                 let trigger_user = order.user;
                 let trigger_order_id = order.order_id;
-                let taker_account_data =
-                    match user_cache.get_user_or_fetch(drift, &trigger_user).await {
-                        Ok(user) => user,
-                        Err(err) => {
-                            log::warn!(target: TARGET, "missing trigger user: {err:?}");
-                            return;
-                        }
-                    };
+                let taker_account_data = match user_cache.get_user(&trigger_user) {
+                    Some(user) => user,
+                    None => {
+                        log::warn!(target: TARGET, "missing trigger user in cache: {trigger_user}");
+                        return;
+                    }
+                };
                 let actual_order = match taker_account_data
                     .orders
                     .iter()
@@ -313,11 +326,10 @@ pub(crate) async fn try_onchain_cross(
     let mut maker_stats_vec: Vec<UserStats> = Vec::new();
     for maker in &maker_accounts {
         let maker_stats_pubkey = Wallet::derive_stats_account(&maker.authority);
-        match user_cache.get_stats_or_fetch(drift, &maker_stats_pubkey).await {
-            Ok(stats) => maker_stats_vec.push(stats),
-            Err(err) => {
-                log::warn!(target: TARGET, "missing maker stats: {err:?}");
-            }
+        if let Some(stats) = user_cache.get_stats(&maker_stats_pubkey) {
+            maker_stats_vec.push(stats);
+        } else {
+            log::warn!(target: TARGET, "missing maker stats in cache: {maker_stats_pubkey}");
         }
     }
 
@@ -329,18 +341,47 @@ pub(crate) async fn try_onchain_cross(
         None,
     );
 
-    if let Some(ix) = tx_builder.ixs().last() {
+    // Jito: no priority fee, only set CU limit + tip.
+    let mut jito_builder = TransactionBuilder::new(
+        drift.program_data(),
+        filler_subaccount,
+        std::borrow::Cow::Borrowed(&filler_account_data),
+        false,
+    )
+    .add_ix(ComputeBudgetInstruction::set_compute_unit_limit(base_cu));
+    if let Some(ref update_msg) = oracle_update {
+        jito_builder =
+            jito_builder.post_pyth_lazer_oracle_update(&[update_msg.feed_id], &update_msg.message);
+    }
+    jito_builder = jito_builder
+        .update_amms(vec![market_index])
+        .proxy_spread_capture(
+            market_index,
+            &filler_stats,
+            maker_accounts.as_slice(),
+            maker_stats_vec.as_slice(),
+            None,
+        );
+    if let Some(ix) = jito_builder.ixs().last() {
         if ix.accounts.len() >= 30 {
-            tx_builder = tx_builder.set_ix(
-                1,
-                ComputeBudgetInstruction::set_compute_unit_limit(base_cu * 3),
+            jito_builder = jito_builder.set_ix(
+                0,
+                ComputeBudgetInstruction::set_compute_unit_limit(bump_cu_limit(base_cu)),
             );
         }
     }
-
-    let rpc_tx = tx_builder.build();
     let jito_tx = jito_tip_ix(*drift.wallet().authority())
-        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+        .map(|ix| jito_builder.build_with_extra_ixs(&[ix]));
+    let mut rpc_builder = tx_builder.with_priority_fee(priority_fee, Some(base_cu));
+    if let Some(ix) = rpc_builder.ixs().last() {
+        if ix.accounts.len() >= 30 {
+            rpc_builder = rpc_builder.set_ix(
+                1,
+                ComputeBudgetInstruction::set_compute_unit_limit(bump_cu_limit(base_cu)),
+            );
+        }
+    }
+    let rpc_tx = rpc_builder.build();
     tx_worker_ref.send_tx_with_jito(
         rpc_tx,
         jito_tx,

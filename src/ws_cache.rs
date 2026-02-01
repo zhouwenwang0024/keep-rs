@@ -44,6 +44,25 @@ impl WsAccountCache {
         slot: u64,
         dlob_notifier: Option<&DLOBNotifier>,
     ) {
+        let prev_user = match self.apply_user_update_and_get_prev(pubkey, user, slot) {
+            Some(prev) => prev,
+            None => return,
+        };
+
+        if let Some(dlob_notifier) = dlob_notifier {
+            match prev_user.as_ref() {
+                Some(prev) => dlob_notifier.user_update(pubkey, Some(prev), &user, slot),
+                None => dlob_notifier.user_update(pubkey, None, &user, slot),
+            }
+        }
+    }
+
+    pub fn apply_user_update_and_get_prev(
+        &self,
+        pubkey: Pubkey,
+        user: User,
+        slot: u64,
+    ) -> Option<Option<User>> {
         let mut prev_user = None;
         if let Some(existing) = self.users.get(&pubkey) {
             if existing.slot > slot {
@@ -53,19 +72,13 @@ impl WsAccountCache {
                     existing.slot,
                     slot
                 );
-                return;
+                return None;
             }
             prev_user = Some(existing.user);
         }
 
-        if let Some(dlob_notifier) = dlob_notifier {
-            match prev_user.as_ref() {
-                Some(prev) => dlob_notifier.user_update(pubkey, Some(prev), &user, slot),
-                None => dlob_notifier.user_update(pubkey, None, &user, slot),
-            }
-        }
-
         self.users.insert(pubkey, UserEntry { user, slot });
+        Some(prev_user)
     }
 
     pub fn upsert_stats(&self, pubkey: Pubkey, stats: UserStats, slot: u64) {

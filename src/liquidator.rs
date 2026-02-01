@@ -11,8 +11,11 @@ use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     str::FromStr,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -411,7 +414,12 @@ impl LiquidatorBot {
         dashboard_state: DashboardStateRef,
     ) -> Self {
         let dlob: &'static DLOB = Box::leak(Box::new(DLOB::default()));
-        let tx_worker = TxWorker::new(drift.clone(), Arc::clone(&metrics), config.dry);
+        let tx_worker = TxWorker::new(
+            drift.clone(),
+            Arc::clone(&metrics),
+            config.dry,
+            config.rpc_skip_preflight,
+        );
         let rt = tokio::runtime::Handle::current();
         let tx_sender = tx_worker.run(rt);
 
@@ -1097,8 +1105,33 @@ async fn setup_ws(
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let user_cache = WsAccountCache::new();
+    let (dlob_tx, mut dlob_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(MarketId, u64, u64)>();
+    let dlob_backlog = Arc::new(AtomicUsize::new(0));
 
     let _ = sync_user_accounts_ws(&drift, &dlob_notifier, &user_cache).await;
+
+    {
+        let dlob_notifier = dlob_notifier.clone();
+        let dlob_backlog = Arc::clone(&dlob_backlog);
+        tokio::spawn(async move {
+            while let Some((market, slot, oracle_price)) = dlob_rx.recv().await {
+                let t0 = Instant::now();
+                dlob_notifier.slot_and_oracle_update(market, slot, oracle_price);
+                dlob_backlog.fetch_sub(1, Ordering::Relaxed);
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                if elapsed_ms > 25 {
+                    log::warn!(
+                        target: TARGET,
+                        "dlob slot update slow: market={}, elapsed_ms={}",
+                        market.index(),
+                        elapsed_ms
+                    );
+                }
+            }
+            log::warn!(target: TARGET, "dlob slot update task ended");
+        });
+    }
 
     let mut oracle_to_market = HashMap::<Pubkey, Vec<(MarketId, OracleSource)>>::default();
 
@@ -1236,18 +1269,22 @@ async fn setup_ws(
     let mut slot_subscriber = SlotSubscriber::new(drift.ws());
     if let Err(err) = slot_subscriber.subscribe({
         let drift = drift.clone();
-        let dlob_notifier = dlob_notifier.clone();
+        let dlob_tx = dlob_tx.clone();
+        let dlob_backlog = Arc::clone(&dlob_backlog);
         let market_ids = perp_market_ids.clone();
         move |update| {
             let new_slot = update.latest_slot;
             for market in market_ids.iter() {
                 match drift.try_get_mmoracle_for_perp_market(market.index(), new_slot) {
                     Ok(oracle_price_data) => {
-                        dlob_notifier.slot_and_oracle_update(
-                            *market,
-                            new_slot,
-                            oracle_price_data.price as u64,
-                        );
+                        dlob_backlog.fetch_add(1, Ordering::Relaxed);
+                        if dlob_tx
+                            .send((*market, new_slot, oracle_price_data.price as u64))
+                            .is_err()
+                        {
+                            dlob_backlog.fetch_sub(1, Ordering::Relaxed);
+                            log::error!(target: TARGET, "dlob slot update channel closed");
+                        }
                     }
                     Err(err) => {
                         log::debug!(
@@ -1315,8 +1352,7 @@ fn try_liquidate_with_match(
         keeper_subaccount,
         std::borrow::Cow::Owned(keeper_account_data),
         false,
-    )
-    .with_priority_fee(priority_fee, Some(cu_limit));
+    );
 
     if let Some(ref update) = pyth_price_update {
         tx_builder = tx_builder.post_pyth_lazer_oracle_update(&[update.feed_id], &update.message);
@@ -1328,19 +1364,19 @@ fn try_liquidate_with_match(
         top_makers,
     );
 
+    let jito_tx = jito_tip_ix(*drift.wallet().authority())
+        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+    let mut rpc_builder = tx_builder.with_priority_fee(priority_fee, Some(cu_limit));
     // large accounts list, bump CU limit to compensate
-    if let Some(ix) = tx_builder.ixs().last() {
+    if let Some(ix) = rpc_builder.ixs().last() {
         if ix.accounts.len() >= 20 {
-            tx_builder = tx_builder.set_ix(
+            rpc_builder = rpc_builder.set_ix(
                 1,
                 ComputeBudgetInstruction::set_compute_unit_limit(cu_limit * 2),
             );
         }
     }
-
-    let rpc_tx = tx_builder.build();
-    let jito_tx = jito_tip_ix(*drift.wallet().authority())
-        .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+    let rpc_tx = rpc_builder.build();
 
     tx_sender.send_tx_with_jito(
         rpc_tx,
@@ -1827,7 +1863,6 @@ impl LiquidateWithMatchStrategy {
                     std::borrow::Cow::Owned(keeper_account_data),
                     false,
                 )
-                .with_priority_fee(priority_fee, Some(cu_limit))
                 .titan_swap_liquidate(
                     titan_result.unwrap(),
                     &asset_spot_market,
@@ -1845,7 +1880,6 @@ impl LiquidateWithMatchStrategy {
                     std::borrow::Cow::Owned(keeper_account_data),
                     false,
                 )
-                .with_priority_fee(priority_fee, Some(cu_limit))
                 .jupiter_swap_liquidate(
                     jupiter_result.unwrap(),
                     &asset_spot_market,
@@ -1857,9 +1891,11 @@ impl LiquidateWithMatchStrategy {
                     &liquidatee_account_data,
                 )
             };
-            let rpc_tx = tx_builder.build();
             let jito_tx = jito_tip_ix(*drift.wallet().authority())
                 .map(|ix| tx_builder.build_with_extra_ixs(&[ix]));
+            let rpc_tx = tx_builder
+                .with_priority_fee(priority_fee, Some(cu_limit))
+                .build();
             // log::debug!(
             //     target: TARGET,
             //     "sending spot liq tx: {liquidatee:?}, asset={asset_market_index}, liability={}",
